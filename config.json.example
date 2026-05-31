@@ -1,0 +1,20 @@
+{
+  "mtg_channel_id": null,
+  "monitored_users": [],
+  "user_name_map": {},
+  "excluded_channels": [],
+  "plural_systems": {},
+  "youtube_allow_age_restricted": false,
+  "youtube_max_duration_s": 7200,
+  "youtube_whisper_model": "small",
+  "_comments": {
+    "mtg_channel_id": "Channel ID where MTG games are played. Bot responds to EVERY message here. Set to null to allow games anywhere.",
+    "monitored_users": "List of Discord user IDs to proactively support. The bot responds when one of these users seems distressed, even without being mentioned. Empty by default — opt in only the users you intend to watch.",
+    "user_name_map": "Maps Discord user IDs to memory file names (without .json). The bot loads memories/[name].json for personalized context.",
+    "excluded_channels": "Channel IDs where the bot should NEVER respond (even to commands). Useful if another bot owns that channel.",
+    "plural_systems": "Maps alter display names (lowercase) to a short prose hint about their system. Used when a PluralKit webhook proxy posts: the bot injects the hint into the system prompt so it understands which alters belong to which system. Example: {\"alex\": \"part of a plural system; Alex is one alter\", \"sam\": \"part of the same system\"}. Leave empty if no plural users on your server — the bot will fall back to a generic plurality-aware note when it sees any PluralKit proxy.",
+    "youtube_allow_age_restricted": "When true, the YouTube transcriber attempts to pull cookies from Chrome to access age-restricted videos. Requires Chrome installed and the operator to be logged in to YouTube. Defaults false (clean OSS posture); flip true for personal use if your server occasionally needs it.",
+    "youtube_max_duration_s": "Refuse transcription requests for videos longer than this many seconds. Default 7200 = 2 hours. Lower it if your hardware is slow with Whisper.",
+    "youtube_whisper_model": "Whisper model name for transcription. Default 'small' — matches the model that ships with `pip install openai-whisper`. Other options: 'tiny' (fastest, lower quality), 'base', 'medium', 'large', 'turbo'. Larger models need more RAM/VRAM and run slower; if you change this, also make sure the weights are downloaded by running `whisper --model <name> <some-audio-file>` once."
+  }
+}

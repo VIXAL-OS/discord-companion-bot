@@ -1,0 +1,26 @@
+# Discord
+discord.py>=2.3.0
+
+# Anthropic Claude API
+anthropic>=0.39.0
+
+# HTTP client (web search, YouTube metadata, etc.)
+aiohttp>=3.9.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Timezone data (needed on Windows)
+tzdata>=2024.1
+
+# Image processing for tarot card rendering
+Pillow>=10.0.0
+
+# Optional: DeepSeek / OpenRouter adapter for cost-efficient model use.
+# Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in .env.
+openai>=1.40.0
+
+# Optional: YouTube transcription via local Whisper.
+# Requires yt-dlp + openai-whisper + ffmpeg on PATH.
+# Bot reacts 🎙️ to YouTube links if installed; skips silently otherwise.
+yt-dlp>=2024.4.9
