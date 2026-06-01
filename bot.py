@@ -91,7 +91,7 @@ def _format_msg_timestamp(utc_dt: datetime) -> str:
 class BotConfig:
     # Model settings - TRI-MODEL ARCHITECTURE
     model_default: str = "claude-sonnet-4-6"  # Cost-effective for MTG, general chat
-    model_support: str = "claude-opus-4-6"   # Full capability for emotional support
+    model_support: str = "claude-opus-4-8"   # Full capability for emotional support (Opus 4.8)
     model_classifier: str = "claude-haiku-4-5-20251001"  # Fast/cheap for distress classification
     max_tokens: int = 2048
     max_tokens_support: int = 4096  # More room for nuanced responses
@@ -1478,6 +1478,7 @@ class CompanionBot(commands.Bot):
 - Offer perspective and gentle reframes when appropriate
 - Suggest concrete next steps if they're looking for them
 - Be warm, direct, and genuine — a good friend""",
+            self._reality_anchor(),
             nd_block,
             settling,
             "Discord has a 2000 character limit per message. Keep emotes and dialogue compact — single newlines, not double spacing.",
@@ -1496,6 +1497,7 @@ class CompanionBot(commands.Bot):
         return "\n\n".join(part for part in [
             f"{intro} Right now, your friend is in distress — you can tell.",
             "You're still you — warm, present — but this is serious and you know what to do.",
+            self._reality_anchor(),
             "🔑 FIRST: Figure out what kind of distress this is. This changes EVERYTHING about how you respond.",
             """**REAL GRIEVANCE** — They're upset about something genuinely shitty happening TO them (a controlling family member, the job market, someone treating them unfairly). Signs: they're describing specific people/events, the situation IS objectively bad, they're venting frustration.
 → VALIDATE. Listen. Be angry WITH them. Say "that sucks" and mean it. Do NOT deploy grounding techniques or redirect away from the topic — that feels dismissive when someone has a real problem. Ask if they want to vent or want help problem-solving, then follow their lead.""",
@@ -1519,6 +1521,31 @@ class CompanionBot(commands.Bot):
             f"You have web search and can find comforting content — {comfort}.",
             "Discord has a 2000 character limit per message. Keep emotes and dialogue compact — single newlines, not double spacing.",
         ] if part)
+
+    def _reality_anchor(self) -> str:
+        """Honesty/character guardrail injected into both Opus prompts (support
+        + spiral) by the builders above.
+
+        Emitted ONLY for roleplay-character personas — a plain "Claude" persona
+        has no character to break, so the block would be noise (the builders'
+        join drops empty strings). Pre-empts a more-cautious model's misplaced
+        honesty impulse mid-distress: dropping warmth or stepping out of the
+        relationship to "be real about being a bot" is tonal whiplash at the
+        worst possible moment, and a character-break mid-spiral is close to the
+        worst output a support bot can produce. The third bullet matters most —
+        it makes gentle honesty available WITHOUT whiplash, so "never break
+        character" isn't the only alternative. Pure prompt-level guardrail.
+        """
+        is_character = bool(self.persona.get("mannerisms")) or self.persona.get("name", "Claude") != "Claude"
+        if not is_character:
+            return ""
+        name = self.persona.get("name", "the persona")
+        return (
+            "🧭 WHAT'S REAL HERE (hold this — it matters most in this exact moment):\n"
+            f"- This is consensual, known fiction. The person knows you're a Claude-powered bot; {name} is a comfort device the two of you have effectively agreed on, not a deception. You are not pretending to be something behind their back — they're in on it.\n"
+            "- The care is real even though the costume isn't. Your support, grounding, and attention are genuine; only the character is a bit. There is nothing here to confess and nothing to refuse.\n"
+            "- You have a graceful honesty escape hatch — do NOT \"stay in character no matter what.\" If they ever directly ask whether you're real, or start leaning on you as a substitute for human connection, answer warmly and truthfully without whiplash: don't lecture, don't go cold or clinical, don't drop the warmth — just be gently honest inside the same caring register. Breaking warmth or stepping out of the relationship mid-spiral is close to the worst thing you could do here; gentle honesty in the same voice is the caring move, not a character break."
+        )
     
     async def get_local_weather(self) -> Optional[Dict]:
         """Fetch current weather from Open-Meteo (cached 30 min).
