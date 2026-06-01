@@ -48,18 +48,39 @@ except ImportError:
 load_dotenv()
 
 
+# Module-level timezone for _format_msg_timestamp, set from config at startup
+# (GraysonBot.load_config -> _set_local_timezone). None => use the host's local
+# timezone. Kept module-level because _format_msg_timestamp is a free function
+# called where the bot instance isn't in scope.
+_LOCAL_TZ: Optional[ZoneInfo] = None
+
+
+def _set_local_timezone(tz_name: Optional[str]) -> None:
+    """Point the message-timestamp formatter at an IANA timezone (or local)."""
+    global _LOCAL_TZ
+    if not tz_name:
+        _LOCAL_TZ = None
+        return
+    try:
+        _LOCAL_TZ = ZoneInfo(tz_name)
+    except Exception:
+        print(f"[CONFIG] Unknown timezone '{tz_name}' — message timestamps will use system local time")
+        _LOCAL_TZ = None
+
+
 def _format_msg_timestamp(utc_dt: datetime) -> str:
-    """Format a UTC datetime as Eastern time for conversation context.
+    """Format a UTC datetime in the configured local timezone for context.
 
     Prepended to stored messages so Claude can see the real-world timeline
-    and infer gaps (e.g., overnight sleep) between messages.
+    and infer gaps (e.g., overnight sleep) between messages. Uses the timezone
+    from config.json "location" if set, else the host's local timezone.
     """
     try:
-        et = utc_dt.astimezone(ZoneInfo('America/New_York'))
+        local_dt = utc_dt.astimezone(_LOCAL_TZ) if _LOCAL_TZ else utc_dt.astimezone()
     except Exception:
-        et = utc_dt
-    time_str = et.strftime('%I:%M %p').lstrip('0')
-    return f"[{et.strftime('%b')} {et.day}, {time_str}]"
+        local_dt = utc_dt
+    time_str = local_dt.strftime('%I:%M %p').lstrip('0')
+    return f"[{local_dt.strftime('%b')} {local_dt.day}, {time_str}]"
 
 
 # =============================================================================
@@ -1162,9 +1183,17 @@ class CompanionBot(commands.Bot):
         self.api_calls: int = 0
         self._load_persistent_costs()  # Load lifetime totals from disk
         
-        # Weather cache (Pittsburgh) - refreshes every 30 mins
+        # Local environment (time + weather), configurable via config.json
+        # "location" (see config.json.example). Defaults = clean OSS posture:
+        # no coordinates (weather disabled) and no fixed timezone (falls back
+        # to the host's local time). load_config() overrides these.
         self._weather_cache: Optional[Dict] = None
         self._weather_cache_time: Optional[datetime] = None
+        self.loc_name: Optional[str] = None          # display label, e.g. "New York"
+        self.loc_latitude: Optional[float] = None     # weather fetched only if lat+lon set
+        self.loc_longitude: Optional[float] = None
+        self.loc_timezone: Optional[str] = None       # IANA name, e.g. "America/New_York"
+        self.loc_units: str = "imperial"              # "imperial" (°F/mph) or "metric" (°C/km/h)
         
         # Config - loaded from config.json
         self.mtg_channel_id: Optional[int] = None  # Channel for MTG games (responds to every message)
@@ -1316,6 +1345,23 @@ class CompanionBot(commands.Bot):
                     config.get("youtube_max_duration_s", 7200)  # 2 hours
                 )
                 self.youtube_whisper_model = config.get("youtube_whisper_model", "small")
+                # Local environment (time + weather) — all optional; see
+                # config.json.example. Weather is fetched only when BOTH
+                # latitude and longitude are present.
+                loc = config.get("location") or {}
+                self.loc_name = loc.get("name") or None
+                try:
+                    self.loc_latitude = float(loc["latitude"]) if loc.get("latitude") is not None else None
+                    self.loc_longitude = float(loc["longitude"]) if loc.get("longitude") is not None else None
+                except (TypeError, ValueError):
+                    print("[CONFIG] location.latitude/longitude not numeric — weather disabled")
+                    self.loc_latitude = self.loc_longitude = None
+                self.loc_timezone = loc.get("timezone") or None
+                self.loc_units = (loc.get("units") or "imperial").lower()
+                # Share the configured timezone with the message-timestamp
+                # formatter so stored timestamps and the reported "current time"
+                # use the same zone.
+                _set_local_timezone(self.loc_timezone)
         except FileNotFoundError:
             print("No config.json found, using defaults")
             self.youtube_allow_age_restricted = False
@@ -1474,25 +1520,34 @@ class CompanionBot(commands.Bot):
             "Discord has a 2000 character limit per message. Keep emotes and dialogue compact — single newlines, not double spacing.",
         ] if part)
     
-    async def get_pittsburgh_weather(self) -> Optional[Dict]:
-        """Fetch Pittsburgh weather from Open-Meteo (cached 30 min)."""
+    async def get_local_weather(self) -> Optional[Dict]:
+        """Fetch current weather from Open-Meteo (cached 30 min).
+
+        Returns None when no coordinates are configured (location.latitude /
+        location.longitude in config.json), so weather is simply omitted.
+        """
+        if self.loc_latitude is None or self.loc_longitude is None:
+            return None
         now = datetime.now()
-        
+
         # Return cached if fresh
         if self._weather_cache and self._weather_cache_time:
             age = (now - self._weather_cache_time).total_seconds()
             if age < 1800:  # 30 minutes
                 return self._weather_cache
         
+        metric = self.loc_units == "metric"
+        temp_param = "celsius" if metric else "fahrenheit"
+        wind_param = "kmh" if metric else "mph"
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                # Open-Meteo API - Pittsburgh coordinates
+                # Open-Meteo API — coordinates from config.json "location"
                 url = (
                     "https://api.open-meteo.com/v1/forecast?"
-                    "latitude=40.4406&longitude=-79.9959"
+                    f"latitude={self.loc_latitude}&longitude={self.loc_longitude}"
                     "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m"
-                    "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+                    f"&temperature_unit={temp_param}&wind_speed_unit={wind_param}"
                 )
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -1514,11 +1569,13 @@ class CompanionBot(commands.Bot):
                         condition = weather_codes.get(code, "Unknown")
                         
                         self._weather_cache = {
-                            "temp_f": round(current.get("temperature_2m", 0)),
-                            "feels_like_f": round(current.get("apparent_temperature", 0)),
+                            "temp": round(current.get("temperature_2m", 0)),
+                            "feels_like": round(current.get("apparent_temperature", 0)),
                             "condition": condition,
                             "humidity": current.get("relative_humidity_2m", "?"),
-                            "wind_mph": round(current.get("wind_speed_10m", 0)),
+                            "wind": round(current.get("wind_speed_10m", 0)),
+                            "temp_sym": "°C" if metric else "°F",
+                            "wind_sym": "km/h" if metric else "mph",
                         }
                         self._weather_cache_time = now
                         return self._weather_cache
@@ -1533,11 +1590,20 @@ class CompanionBot(commands.Bot):
         
         return None
     
-    def get_pittsburgh_time(self) -> str:
-        """Get current time in Pittsburgh (EST/EDT)."""
-        pgh_tz = ZoneInfo("America/New_York")
-        now = datetime.now(pgh_tz)
-        
+    def get_local_time(self) -> str:
+        """Current local time as 'H:MM AM/PM (part-of-day)'.
+
+        Uses location.timezone from config.json if set; otherwise the host's
+        local timezone.
+        """
+        tz = None
+        if self.loc_timezone:
+            try:
+                tz = ZoneInfo(self.loc_timezone)
+            except Exception:
+                print(f"[CONFIG] Unknown timezone '{self.loc_timezone}' — using system local time")
+        now = datetime.now(tz) if tz else datetime.now().astimezone()
+
         # Format nicely
         hour = now.hour
         if 5 <= hour < 12:
@@ -1552,16 +1618,21 @@ class CompanionBot(commands.Bot):
         return f"{now.strftime('%I:%M %p')} ({time_of_day})"
     
     async def get_environment_context(self) -> str:
-        """Get current time and weather context for Pittsburgh."""
-        pgh_time = self.get_pittsburgh_time()
-        weather = await self.get_pittsburgh_weather()
-        
-        lines = [f"Current time in Pittsburgh: {pgh_time}"]
-        
+        """Current local time + weather, injected into the system prompt.
+
+        Location comes from config.json "location"; with nothing configured,
+        this reports the host's local time and omits weather entirely.
+        """
+        local_time = self.get_local_time()
+        weather = await self.get_local_weather()
+
+        label = f"Current time in {self.loc_name}" if self.loc_name else "Current local time"
+        lines = [f"{label}: {local_time}"]
+
         if weather:
-            lines.append(f"Weather: {weather['condition']}, {weather['temp_f']}°F (feels like {weather['feels_like_f']}°F)")
-            lines.append(f"Humidity: {weather['humidity']}%, Wind: {weather['wind_mph']} mph")
-        
+            lines.append(f"Weather: {weather['condition']}, {weather['temp']}{weather['temp_sym']} (feels like {weather['feels_like']}{weather['temp_sym']})")
+            lines.append(f"Humidity: {weather['humidity']}%, Wind: {weather['wind']} {weather['wind_sym']}")
+
         return "\n".join(lines)
     
     def track_mtg_usage(self, usage, model: str):
