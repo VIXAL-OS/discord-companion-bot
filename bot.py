@@ -130,6 +130,15 @@ class BotConfig:
     est_wh_per_1k_deepseek: float = 0.3   # sparse MoE (~37B active)
     grid_gco2_per_kwh: float = 300.0            # Anthropic AWS/GCP blended est.
     grid_gco2_per_kwh_deepseek: float = 550.0   # DeepSeek China API (east-CN grid)
+
+    # Bookclub: !load a text into a channel; it's injected (prompt-cached, ~10%
+    # on repeat reads) into the model's 1M-token context and discussed. The book
+    # rides in `system`, NOT the trimmed history, so max_input_tokens doesn't
+    # clip it. bookclub_model "" = use the channel's normal model (Sonnet 5, 1M);
+    # set to model_support (Opus 4.8) for deeper literary discussion.
+    bookclub_model: str = ""
+    bookclub_reply_max_tokens: int = 4096
+    bookclub_max_book_tokens: int = 900_000   # fits a 1M-context model with headroom
     
     # Web search settings
     web_search_enabled: bool = True
@@ -1098,6 +1107,21 @@ class DistressDetector:
 # MAIN BOT CLASS
 # =============================================================================
 
+@dataclass
+class ReadingMaterial:
+    """A text loaded into a channel for bookclub discussion. Injected (prompt-
+    cached) into the system prompt so the whole work rides in the model's
+    1M-token context without hitting the 30k conversation-history trim."""
+    title: str
+    text: str
+    url: str = ""
+    loaded_at: datetime = field(default_factory=datetime.now)
+
+    @property
+    def estimated_tokens(self) -> int:
+        return int(len(self.text) / CONFIG.chars_per_token)
+
+
 class CompanionBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -1132,6 +1156,10 @@ class CompanionBot(commands.Bot):
         
         # Per-thread conversation history
         self.conversations: Dict[int, List[Dict]] = defaultdict(list)
+
+        # Bookclub: channel_id -> ReadingMaterial (in-memory; cleared on restart).
+        # Injected as a cached system block when the bot chats in that channel.
+        self.reading_materials: Dict[int, ReadingMaterial] = {}
         
         # Two-tier memory system per user
         self.memories: Dict[int, TwoTierMemory] = {}
@@ -1419,6 +1447,40 @@ class CompanionBot(commands.Bot):
         prefix = f"Roleplay mannerisms ({notes}):" if notes else "Roleplay mannerisms (use sparingly, naturally):"
         return f"{prefix}\n" + "\n".join(manns)
 
+    @staticmethod
+    def _strip_html(raw: str) -> str:
+        """Crude HTML → text (no bs4 dependency): drop script/style, strip tags,
+        unescape entities, collapse whitespace. Good enough for bookclub reading."""
+        import html as _htmlmod
+        raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+        raw = _htmlmod.unescape(raw)
+        raw = re.sub(r"[ \t]+", " ", raw)
+        raw = re.sub(r"\n\s*\n\s*\n+", "\n\n", raw)
+        return raw.strip()
+
+    async def _fetch_url_text(self, url: str) -> Tuple[Optional[str], str]:
+        """Fetch a URL and return (text, "") or (None, error). HTML is stripped
+        to plain text; anything else is returned as-is. No bs4 — see _strip_html."""
+        if not url.startswith(("http://", "https://")):
+            return None, "not an http(s) URL"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": "Mozilla/5.0 (companion-bot bookclub)"},
+                ) as resp:
+                    if resp.status != 200:
+                        return None, f"HTTP {resp.status}"
+                    ctype = resp.headers.get("content-type", "")
+                    raw = await resp.text()
+        except Exception as e:
+            return None, str(e)
+        looks_html = "html" in ctype.lower() or raw.lstrip()[:100].lower().startswith(
+            ("<!doctype", "<html")
+        )
+        return (self._strip_html(raw) if looks_html else raw), ""
+
     def build_base_prompt(self) -> str:
         """Compose the base system prompt for general chat / MTG interactions."""
         p = self.persona
@@ -1452,7 +1514,8 @@ class CompanionBot(commands.Bot):
    Players can challenge you directly with "!game @{name} commander" — you play as the AI opponent. You guide players on commands during games.
 3. Web search — you can search the web automatically when you need current info (local businesses, recent events, prices, etc.). When you search, ALWAYS include the full source URLs in your response text (like https://example.com). These get extracted and shown as clickable links.
 4. Card lookups: !card (pretty Scryfall display) and !xmage (raw rules engine data from XMage's 87,000+ card database)
-5. General conversation and being a comforting presence""",
+5. Bookclub — someone can !load a text (a URL, or an attached .txt/.md file) into a channel, and you'll read and discuss the whole work with them (it's held in your context); !unload when done, !book to see what's loaded
+6. General conversation and being a comforting presence""",
             """Communication style notes:
 - When someone replies to your message, you can see what they're replying to — trust that context
 - Don't second-guess yourself or apologize for confusion when following up on something you said
@@ -3108,11 +3171,40 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
                 if is_mtg_channel:
                     tool_list.append(self.GAME_LOG_TOOL_SCHEMA)
 
+                # Bookclub: if a work is loaded for this channel (or its parent),
+                # inject it as a prompt-cached system block so the whole text rides
+                # in the model's 1M context (bypassing the 30k history trim), and —
+                # outside distress — optionally use the deeper bookclub model.
+                system = self.build_system_prompt(
+                    message.author, distress_level, environment, game_context, message=message
+                )
+                book = self.reading_materials.get(channel_id) or (
+                    self.reading_materials.get(parent_id) if parent_id else None
+                )
+                if book is not None:
+                    fic_block = (
+                        f"You're in a bookclub discussion of '{book.title}'"
+                        + (f" (source: {book.url})" if book.url else "")
+                        + ". The full text follows between the markers — treat it as "
+                        "canonical source material: reference specific passages, "
+                        "characters, and plot points freely, and consider any question "
+                        "about the work answered by the text itself.\n"
+                        f"--- BEGIN WORK ---\n{book.text}\n--- END WORK ---"
+                    )
+                    system = [
+                        {"type": "text", "text": fic_block,
+                         "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": system},
+                    ]
+                    if distress_level == "none" and CONFIG.bookclub_model:
+                        model = CONFIG.bookclub_model
+                    max_tokens = max(max_tokens, CONFIG.bookclub_reply_max_tokens)
+
                 response = await asyncio.to_thread(
                     self.claude.messages.create,
                     model=model,
                     max_tokens=max_tokens,
-                    system=self.build_system_prompt(message.author, distress_level, environment, game_context, message=message),
+                    system=system,
                     messages=self.conversations[thread_id],
                     tools=tool_list
                 )
@@ -3164,12 +3256,18 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
                         self.total_output_tokens += response.usage.output_tokens
                         self.api_calls += 1
 
-                    # Continue conversation with tool results
+                    # Continue conversation with tool results. Pass system=system
+                    # (carrying the cached bookclub fic + persona) and the prior
+                    # history so the answer-producing call isn't blind to the loaded
+                    # work or the user's question. The fic block is cache_control'd,
+                    # so re-sending it is a cheap cache read.
                     response = await asyncio.to_thread(
                         self.claude.messages.create,
                         model=model,
                         max_tokens=max_tokens,
+                        system=system,
                         messages=[
+                            *self.conversations[thread_id],
                             {"role": "assistant", "content": response.content},
                             {"role": "user", "content": tool_results}
                         ],
@@ -4299,6 +4397,77 @@ class SupportCog(commands.Cog, name="Support"):
             except Exception as e:
                 print(f"Error summarizing: {e}")
                 await ctx.send("*ear flick* Sorry, I had trouble summarizing. Try again?")
+
+    # --- Bookclub: !load a text into a channel and discuss it ----------------
+
+    @commands.command(name="load")
+    async def load_book(self, ctx, *, url: str = ""):
+        """Load a text into this channel for bookclub discussion.
+
+        Attach a .txt/.md/.html file, or `!load <url>` to fetch a web page. The
+        work rides (prompt-cached) in the model's 1M context — ask about it
+        anytime, `!unload` when done. In-memory (cleared on restart).
+        """
+        title = text = None
+        src_url = ""
+        if ctx.message.attachments:
+            att = ctx.message.attachments[0]
+            if att.size > 8_000_000:
+                await ctx.send("*ear flick* That file's over 8 MB — too big. Try a smaller excerpt.")
+                return
+            raw = (await att.read()).decode("utf-8", errors="replace")
+            text = (self.bot._strip_html(raw)
+                    if att.filename.lower().endswith((".html", ".htm")) else raw)
+            title = att.filename.rsplit(".", 1)[0]
+        elif url:
+            clean = url.strip("<> ")
+            async with ctx.typing():
+                text, err = await self.bot._fetch_url_text(clean)
+            if text is None:
+                await ctx.send(f"*tilts head* Couldn't load that URL — {err}.")
+                return
+            src_url = clean
+            title = clean.rstrip("/").rsplit("/", 1)[-1] or clean
+        else:
+            await ctx.send("Attach a `.txt`/`.md`/`.html` file, or give me a URL: `!load <url>`.")
+            return
+        text = (text or "").strip()
+        if not text:
+            await ctx.send("*blink* That came back empty — nothing to read.")
+            return
+        mat = ReadingMaterial(title=title, text=text, url=src_url)
+        if mat.estimated_tokens > CONFIG.bookclub_max_book_tokens:
+            await ctx.send(
+                f"*ear flick* That's ~{mat.estimated_tokens:,} tokens — over the "
+                f"{CONFIG.bookclub_max_book_tokens:,}-token bookclub cap. Load a smaller excerpt."
+            )
+            return
+        self.bot.reading_materials[ctx.channel.id] = mat
+        model_note = (f" I'll discuss it on `{CONFIG.bookclub_model}`."
+                      if CONFIG.bookclub_model else "")
+        await ctx.send(
+            f"📖 Loaded **{mat.title}** (~{mat.estimated_tokens:,} tokens) for this channel. "
+            f"Ask me anything about it — `!unload` when we're done.{model_note}"
+        )
+
+    @commands.command(name="unload")
+    async def unload_book(self, ctx):
+        """Drop the bookclub text loaded in this channel."""
+        mat = self.bot.reading_materials.pop(ctx.channel.id, None)
+        if mat is None:
+            await ctx.send("Nothing's loaded in this channel.")
+        else:
+            await ctx.send(f"📕 Unloaded **{mat.title}**.")
+
+    @commands.command(name="book", aliases=["loaded"])
+    async def book_status(self, ctx):
+        """Show what's loaded for bookclub in this channel."""
+        mat = self.bot.reading_materials.get(ctx.channel.id)
+        if mat is None:
+            await ctx.send("No bookclub work loaded here. `!load <url>` or attach a `.txt` to start one.")
+        else:
+            src = f" · {mat.url}" if mat.url else ""
+            await ctx.send(f"📖 Loaded: **{mat.title}** (~{mat.estimated_tokens:,} tokens{src}).")
 
 
 # =============================================================================
