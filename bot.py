@@ -90,7 +90,7 @@ def _format_msg_timestamp(utc_dt: datetime) -> str:
 @dataclass
 class BotConfig:
     # Model settings - TRI-MODEL ARCHITECTURE
-    model_default: str = "claude-sonnet-4-6"  # Cost-effective for MTG, general chat
+    model_default: str = "claude-sonnet-5"  # Cost-effective for MTG, general chat (Sonnet 5, 1M ctx)
     model_support: str = "claude-opus-4-8"   # Full capability for emotional support (Opus 4.8)
     model_classifier: str = "claude-haiku-4-5-20251001"  # Fast/cheap for distress classification
     max_tokens: int = 2048
@@ -110,15 +110,26 @@ class BotConfig:
     # Sonnet pricing
     sonnet_input_cost_per_million: float = 3.0
     sonnet_output_cost_per_million: float = 15.0
-    # Opus 4.x pricing (May 17 audit: was $5/$25, but Opus 4 / 4.x is $15/$75
-    # per Anthropic's public pricing page. Low historical impact because the
-    # Opus bucket is only used by emotional-support pathway, but worth keeping
-    # accurate for cost-display correctness.)
-    opus_input_cost_per_million: float = 15.0
-    opus_output_cost_per_million: float = 75.0
-    # Haiku pricing (semantic distress classifier)
-    haiku_input_cost_per_million: float = 0.80
-    haiku_output_cost_per_million: float = 4.0
+    # Opus 4.8 pricing (2026-07 correction: the earlier "$15/$75" audit was wrong
+    # — that was Opus 3's old rate. model_support is claude-opus-4-8, which is
+    # $5/$25 per Mtok. The Opus bucket is only the emotional-support pathway.)
+    opus_input_cost_per_million: float = 5.0
+    opus_output_cost_per_million: float = 25.0
+    # Haiku 4.5 pricing (semantic distress classifier): $1/$5 per Mtok.
+    haiku_input_cost_per_million: float = 1.0
+    haiku_output_cost_per_million: float = 5.0
+
+    # 🌱 Carbon/energy tracking — order-of-magnitude estimates only (like the $
+    # figures, never authoritative). Per-tier inference energy (Wh per 1k tokens)
+    # × grid carbon intensity → a rough CO₂e for the token buckets. Claude runs on
+    # Anthropic's AWS (Trainium/Rainier) + GCP fleet; DeepSeek's own API is on the
+    # (dirtier) China grid. All VERIFY — used for the !cost display, not billing.
+    est_wh_per_1k_opus: float = 0.5       # large model
+    est_wh_per_1k_sonnet: float = 0.3
+    est_wh_per_1k_haiku: float = 0.1      # small / fast
+    est_wh_per_1k_deepseek: float = 0.3   # sparse MoE (~37B active)
+    grid_gco2_per_kwh: float = 300.0            # Anthropic AWS/GCP blended est.
+    grid_gco2_per_kwh_deepseek: float = 550.0   # DeepSeek China API (east-CN grid)
     
     # Web search settings
     web_search_enabled: bool = True
@@ -1861,6 +1872,26 @@ class CompanionBot(commands.Bot):
             + (mtg_deepseek_pro_out / 1_000_000) * 1.68      # V4-Pro output
         )
 
+        # 🌱 Rough energy + carbon for the token buckets above (order-of-magnitude,
+        # like the $ figures). Claude tiers ride the Anthropic grid estimate;
+        # DeepSeek rides the China-grid estimate.
+        def _wh(tokens: int, wh_per_1k: float) -> float:
+            return (tokens / 1000.0) * wh_per_1k
+        claude_wh = (
+            _wh(self.opus_input_tokens + self.opus_output_tokens, CONFIG.est_wh_per_1k_opus)
+            + _wh(self.sonnet_input_tokens + self.sonnet_output_tokens, CONFIG.est_wh_per_1k_sonnet)
+            + _wh(self.haiku_input_tokens + self.haiku_output_tokens, CONFIG.est_wh_per_1k_haiku)
+        )
+        deepseek_tokens = (
+            self.deepseek_input_tokens + self.deepseek_output_tokens
+            + getattr(self, 'deepseek_pro_input_tokens', 0)
+            + getattr(self, 'deepseek_pro_output_tokens', 0)
+        )
+        deepseek_wh = _wh(deepseek_tokens, CONFIG.est_wh_per_1k_deepseek)
+        energy_wh = claude_wh + deepseek_wh
+        co2_g = ((claude_wh / 1000.0) * CONFIG.grid_gco2_per_kwh
+                 + (deepseek_wh / 1000.0) * CONFIG.grid_gco2_per_kwh_deepseek)
+
         lines = [
             "**\U0001f4b0 Lifetime API Usage**",
             "",
@@ -1887,6 +1918,11 @@ class CompanionBot(commands.Bot):
             f"  \u2022 {self.mtg_game_calls} game decisions",
             f"  \u2022 {self.mtg_game_input_tokens:,} input + {self.mtg_game_output_tokens:,} output",
             f"  \u2022 Est. cost: ${mtg_cost:.4f}",
+            "",
+            "**\U0001f331 Estimated energy / carbon (order-of-magnitude):**",
+            f"  \u2022 \u2248 {energy_wh:,.1f} Wh \u2248 {co2_g:,.0f} g CO\u2082e",
+            f"  \u2022 grids: Claude \u2248 {CONFIG.grid_gco2_per_kwh:.0f}, "
+            f"DeepSeek \u2248 {CONFIG.grid_gco2_per_kwh_deepseek:.0f} g/kWh (est.)",
             "",
             f"**\U0001f4b5 Total Lifetime Cost: ${total_cost:.4f}**",
         ]
