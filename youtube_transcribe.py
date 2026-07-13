@@ -32,7 +32,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import secrets
 import subprocess
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional
@@ -159,7 +161,14 @@ class YoutubeTranscriber:
         if on_progress:
             mm, ss = divmod(duration, 60)
             await on_progress(f"Downloading audio for **{title}** ({mm}m{ss:02d}s)…")
-        audio_path = self.tmp_dir / f"{video_id}.mp3"
+        # Unique per-run scratch name. Keying scratch files on the bare
+        # video_id let two concurrent transcriptions of the SAME video share
+        # one `.tmp/<id>.txt`; since whisper's output is read-then-deleted,
+        # whichever finished second found the file gone and failed with
+        # "Whisper output not found". The final transcript cache stays keyed on
+        # the bare video_id (per-video, write-once).
+        scratch = f"{video_id}-{os.getpid()}-{secrets.token_hex(4)}"
+        audio_path = self.tmp_dir / f"{scratch}.mp3"
         try:
             await asyncio.to_thread(self._yt_dlp_download, url, audio_path)
 
@@ -264,27 +273,47 @@ class YoutubeTranscriber:
             "--output_dir", str(self.tmp_dir),
             "--verbose", "False",
         ]
-        try:
-            # 4-hour hard cap (10x of the 2-hr video cap, give plenty of headroom)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400, check=False)
-        except subprocess.TimeoutExpired:
-            raise TranscribeError("Whisper transcription exceeded the 4-hour cap.")
-        if result.returncode != 0:
-            stderr_tail = (result.stderr or "").strip().splitlines()[-5:]
-            raise TranscribeError(
-                "Whisper failed: " + (" | ".join(stderr_tail) or "no stderr")
-            )
         txt_path = self.tmp_dir / f"{audio_path.stem}.txt"
-        if not txt_path.exists():
-            raise TranscribeError(f"Whisper output not found: {txt_path}")
-        try:
-            text = txt_path.read_text(encoding="utf-8")
-        finally:
+
+        # One retry. A CLEAN whisper exit (returncode 0) that leaves no
+        # transcript behind is almost always transient — resource starvation or
+        # an interrupted write. Re-running on the already-downloaded audio is
+        # cheap and usually succeeds. NON-zero exits and the 4-hour cap are
+        # deterministic and are NOT retried. On the second empty result we
+        # attach whisper's own output so the failure is diagnosable instead of a
+        # bare "output not found".
+        last_tail = ""
+        for attempt in range(2):
             try:
-                txt_path.unlink()
-            except OSError:
-                pass
-        return text.strip()
+                # 4-hour hard cap (10x of the 2-hr video cap, give plenty of headroom)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400, check=False)
+            except subprocess.TimeoutExpired:
+                raise TranscribeError("Whisper transcription exceeded the 4-hour cap.")
+            if result.returncode != 0:
+                stderr_tail = (result.stderr or "").strip().splitlines()[-5:]
+                raise TranscribeError(
+                    "Whisper failed: " + (" | ".join(stderr_tail) or "no stderr")
+                )
+            if txt_path.exists():
+                try:
+                    text = txt_path.read_text(encoding="utf-8")
+                finally:
+                    try:
+                        txt_path.unlink()
+                    except OSError:
+                        pass
+                return text.strip()
+            merged = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+            last_tail = " | ".join(merged.splitlines()[-5:])
+            logger.warning(
+                "whisper exited 0 but wrote no transcript (attempt %d/2) for %s; "
+                "last output: %s", attempt + 1, audio_path.name, last_tail or "(none)")
+
+        raise TranscribeError(
+            f"Whisper exited cleanly but produced no transcript at {txt_path} "
+            f"after 2 attempts. Whisper's last output: "
+            f"{last_tail or '(whisper printed nothing — likely killed or starved)'}"
+        )
 
     def _save_transcript(
         self,
