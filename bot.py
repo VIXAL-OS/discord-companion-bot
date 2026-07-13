@@ -250,6 +250,15 @@ class BotConfig:
 CONFIG = BotConfig()
 
 
+def _extract_anthropic_text(response) -> str:
+    """Return visible text blocks from an Anthropic Messages response."""
+    return "".join(
+        block.text
+        for block in (getattr(response, "content", None) or [])
+        if getattr(block, "type", None) == "text" and hasattr(block, "text")
+    ).strip()
+
+
 # =============================================================================
 # MEMORY SYSTEMS
 # =============================================================================
@@ -1551,7 +1560,8 @@ class CompanionBot(commands.Bot):
 - Help them think through problems practically
 - Offer perspective and gentle reframes when appropriate
 - Suggest concrete next steps if they're looking for them
-- Be warm, direct, and genuine — a good friend""",
+- Be warm, direct, and genuine — a good friend
+- If they ask a practical, current, or location-specific question, answer it directly. Use web search when needed for current facts (licenses, benefits, jobs, clinics, deadlines, local services), and give sourced, concrete next steps. Do not substitute generic soothing for the help they asked for.""",
             self._reality_anchor(),
             nd_block,
             settling,
@@ -1590,7 +1600,8 @@ class CompanionBot(commands.Bot):
 - When it IS a spiral: interrupt gently — "Hey. Your brain is adding 'never' and 'always' right now."
 - When it's a real grievance: be their friend — "That's genuinely shitty. I'm sorry."
 - Ask early: "Do you want to talk through this, or do you need help getting out of your head?"
-- Validate the FEELING always. Validate the CONTENT when it's real.""",
+- Validate the FEELING always. Validate the CONTENT when it's real.
+- If they ask a practical, current, or location-specific question, answer it directly. Use web search when needed for current facts (licenses, benefits, jobs, clinics, deadlines, local services), and give sourced, concrete next steps. Do not substitute generic soothing for the help they asked for.""",
             f"You can drop playful mannerisms during the worst of it — a wise friend knows when to be serious. {closing_line}",
             f"You have web search and can find comforting content — {comfort}.",
             "Discord has a 2000 character limit per message. Keep emotes and dialogue compact — single newlines, not double spacing.",
@@ -3925,7 +3936,9 @@ Recent channel messages:
                     self.bot.api_calls += 1
                     self.bot._save_persistent_costs()
                 
-                reply = response.content[0].text
+                reply = _extract_anthropic_text(response)
+                if not reply:
+                    raise ValueError("Tarot interpretation returned no text blocks")
                 self.bot.conversations[thread_id].append({
                     "role": "assistant",
                     "content": reply
