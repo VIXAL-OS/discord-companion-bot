@@ -45,6 +45,52 @@ except ImportError:
     HAS_VISUAL_TAROT = False
     print("⚠️ Visual tarot engine not found in rules/ - using basic tarot")
 
+# pypdf is optional — only needed for !load with a .pdf attachment (bookclub).
+# Missing => !load returns a pip-install hint; everything else unaffected.
+try:
+    from pypdf import PdfReader as _PdfReader
+    _HAS_PYPDF = True
+except ImportError:
+    _PdfReader = None
+    _HAS_PYPDF = False
+
+
+def _extract_pdf_text(data: bytes) -> Tuple[str, int]:
+    """Extract plain text from PDF bytes. Returns (text, page_count).
+
+    Raises ValueError with a user-facing message for password-protected PDFs
+    and for PDFs with no extractable text (scanned/image-only — those need
+    OCR, which is out of scope; convert to .txt upstream).
+    """
+    reader = _PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        decrypted = False
+        try:
+            # Many "encrypted" PDFs only set an owner password; an empty user
+            # password opens them (PasswordType.NOT_DECRYPTED is falsy).
+            decrypted = bool(reader.decrypt(""))
+        except Exception:
+            decrypted = False
+        if not decrypted:
+            raise ValueError(
+                "that PDF is password-protected. Decrypt it first "
+                "(e.g. `qpdf --decrypt`) or export it to `.txt`"
+            )
+    pages = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")  # one unparseable page shouldn't sink the book
+    text = "\n\n".join(pages)
+    if not text.strip():
+        raise ValueError(
+            "that PDF has no extractable text — probably scanned/image-only. "
+            "Run it through an OCR tool and load the resulting `.txt`"
+        )
+    return text, len(reader.pages)
+
+
 load_dotenv()
 
 
@@ -1523,7 +1569,7 @@ class CompanionBot(commands.Bot):
    Players can challenge you directly with "!game @{name} commander" — you play as the AI opponent. You guide players on commands during games.
 3. Web search — you can search the web automatically when you need current info (local businesses, recent events, prices, etc.). When you search, ALWAYS include the full source URLs in your response text (like https://example.com). These get extracted and shown as clickable links.
 4. Card lookups: !card (pretty Scryfall display) and !xmage (raw rules engine data from XMage's 87,000+ card database)
-5. Bookclub — someone can !load a text (a URL, or an attached .txt/.md file) into a channel, and you'll read and discuss the whole work with them (it's held in your context); !unload when done, !book to see what's loaded
+5. Bookclub — someone can !load a text (a URL, or an attached .txt/.md/.pdf file) into a channel, and you'll read and discuss the whole work with them (it's held in your context); !unload when done, !book to see what's loaded
 6. General conversation and being a comforting presence""",
             """Communication style notes:
 - When someone replies to your message, you can see what they're replying to — trust that context
@@ -4417,9 +4463,9 @@ class SupportCog(commands.Cog, name="Support"):
     async def load_book(self, ctx, *, url: str = ""):
         """Load a text into this channel for bookclub discussion.
 
-        Attach a .txt/.md/.html file, or `!load <url>` to fetch a web page. The
-        work rides (prompt-cached) in the model's 1M context — ask about it
-        anytime, `!unload` when done. In-memory (cleared on restart).
+        Attach a .txt/.md/.html/.pdf file, or `!load <url>` to fetch a web
+        page. The work rides (prompt-cached) in the model's 1M context — ask
+        about it anytime, `!unload` when done. In-memory (cleared on restart).
         """
         title = text = None
         src_url = ""
@@ -4428,9 +4474,27 @@ class SupportCog(commands.Cog, name="Support"):
             if att.size > 8_000_000:
                 await ctx.send("*ear flick* That file's over 8 MB — too big. Try a smaller excerpt.")
                 return
-            raw = (await att.read()).decode("utf-8", errors="replace")
-            text = (self.bot._strip_html(raw)
-                    if att.filename.lower().endswith((".html", ".htm")) else raw)
+            if att.filename.lower().endswith(".pdf"):
+                if not _HAS_PYPDF:
+                    await ctx.send(
+                        "*ear flick* PDFs need `pypdf` — `pip install pypdf`, "
+                        "or convert to `.txt` and try again."
+                    )
+                    return
+                data = await att.read()
+                try:
+                    # CPU-bound; keep a book-length extraction off the event loop.
+                    text, _pdf_pages = await asyncio.to_thread(_extract_pdf_text, data)
+                except ValueError as e:
+                    await ctx.send(f"*tilts head* {e}.")
+                    return
+                except Exception as e:
+                    await ctx.send(f"*tilts head* Couldn't parse that PDF — {e}.")
+                    return
+            else:
+                raw = (await att.read()).decode("utf-8", errors="replace")
+                text = (self.bot._strip_html(raw)
+                        if att.filename.lower().endswith((".html", ".htm")) else raw)
             title = att.filename.rsplit(".", 1)[0]
         elif url:
             clean = url.strip("<> ")
@@ -4442,7 +4506,7 @@ class SupportCog(commands.Cog, name="Support"):
             src_url = clean
             title = clean.rstrip("/").rsplit("/", 1)[-1] or clean
         else:
-            await ctx.send("Attach a `.txt`/`.md`/`.html` file, or give me a URL: `!load <url>`.")
+            await ctx.send("Attach a `.txt`/`.md`/`.html`/`.pdf` file, or give me a URL: `!load <url>`.")
             return
         text = (text or "").strip()
         if not text:

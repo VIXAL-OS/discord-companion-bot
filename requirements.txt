@@ -20,6 +20,10 @@ Pillow>=10.0.0
 # Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in .env.
 openai>=1.40.0
 
+# Optional: PDF bookclub loads (!load with a .pdf attachment).
+# Missing => !load asks for `pip install pypdf`; everything else unaffected.
+pypdf>=4.0.0
+
 # Optional: YouTube transcription via local Whisper.
 # Requires yt-dlp + openai-whisper + ffmpeg on PATH.
 # Bot reacts 🎙️ to YouTube links if installed; skips silently otherwise.
