@@ -137,10 +137,13 @@ def _format_msg_timestamp(utc_dt: datetime) -> str:
 class BotConfig:
     # Model settings - TRI-MODEL ARCHITECTURE
     model_default: str = "claude-sonnet-5"  # Cost-effective for MTG, general chat (Sonnet 5, 1M ctx)
-    model_support: str = "claude-opus-4-8"   # Full capability for emotional support (Opus 4.8)
+    model_support: str = "claude-opus-5"   # Full capability for emotional support (Opus 5)
     model_classifier: str = "claude-haiku-4-5-20251001"  # Fast/cheap for distress classification
     max_tokens: int = 2048
-    max_tokens_support: int = 4096  # More room for nuanced responses
+    # More room for nuanced responses. Doubled for Opus 5: adaptive thinking is
+    # on by default there and thinking tokens share this cap with the reply
+    # (only generated tokens bill, so the higher cap costs nothing by itself).
+    max_tokens_support: int = 8192
 
     # Context management
     max_messages_per_thread: int = 20
@@ -156,9 +159,10 @@ class BotConfig:
     # Sonnet pricing
     sonnet_input_cost_per_million: float = 3.0
     sonnet_output_cost_per_million: float = 15.0
-    # Opus 4.8 pricing (2026-07 correction: the earlier "$15/$75" audit was wrong
-    # — that was Opus 3's old rate. model_support is claude-opus-4-8, which is
-    # $5/$25 per Mtok. The Opus bucket is only the emotional-support pathway.)
+    # Opus pricing (2026-07 correction: the earlier "$15/$75" audit was wrong
+    # — that was Opus 3's old rate. model_support is claude-opus-5, which is
+    # $5/$25 per Mtok, unchanged from Opus 4.8. The Opus bucket is only the
+    # emotional-support pathway.)
     opus_input_cost_per_million: float = 5.0
     opus_output_cost_per_million: float = 25.0
     # Haiku 4.5 pricing (semantic distress classifier): $1/$5 per Mtok.
@@ -181,7 +185,7 @@ class BotConfig:
     # on repeat reads) into the model's 1M-token context and discussed. The book
     # rides in `system`, NOT the trimmed history, so max_input_tokens doesn't
     # clip it. bookclub_model "" = use the channel's normal model (Sonnet 5, 1M);
-    # set to model_support (Opus 4.8) for deeper literary discussion.
+    # set to model_support (Opus 5) for deeper literary discussion.
     bookclub_model: str = ""
     bookclub_reply_max_tokens: int = 4096
     bookclub_max_book_tokens: int = 900_000   # fits a 1M-context model with headroom
@@ -4450,7 +4454,9 @@ class SupportCog(commands.Cog, name="Support"):
                     self.bot.api_calls += 1
                     self.bot._save_persistent_costs()
                 
-                summary = response.content[0].text
+                # Sonnet 5 / Opus 5 run adaptive thinking by default, so
+                # content[0] can be a thinking block — take the first text block.
+                summary = next((b.text for b in response.content if b.type == "text"), "")
                 await self.bot.send_long_message(ctx.channel, f"**📋 Summary of last {len(messages)} messages**\n\n{summary}")
                 
             except Exception as e:
