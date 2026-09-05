@@ -3713,7 +3713,7 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
                             await message.channel.send(
                                 "*nudges you gently* Red pandas wrap their fluffy tails around themselves like blankets to stay warm! \U0001f43c"
                             )
-                
+
                 except anthropic.APIError as e:
                     print(f"API Error: {e}")
                     if is_billing_error(e):
