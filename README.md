@@ -48,6 +48,7 @@ python bot.py
 |---|---|
 | `bot_persona` | Character layer (file under `personas/`). Default `plain`. |
 | `monitored_users` | Discord user IDs to proactively monitor for distress. **Empty by default** — opt-in only. |
+| `maintainer_user_id` | Optional. Discord user to DM when an API provider returns a billing error (Anthropic credit exhausted, DeepSeek 402, DashScope arrears). Defaults to the bot's application owner. |
 | `user_name_map` | Discord-ID → memory-file-name map. Lets you store per-user context in `memories/<name>.json`. |
 | `excluded_channels` | Channel IDs where the bot never responds. |
 | `plural_systems` | PluralKit alter → system-name map (helps the bot understand alters share an account). |

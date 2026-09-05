@@ -20,9 +20,9 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import anthropic
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as _date
 from typing import Optional, Dict, List, Any, Tuple
 from functools import partial
 from zoneinfo import ZoneInfo
@@ -95,7 +95,7 @@ load_dotenv()
 
 
 # Module-level timezone for _format_msg_timestamp, set from config at startup
-# (GraysonBot.load_config -> _set_local_timezone). None => use the host's local
+# (CompanionBot.load_config -> _set_local_timezone). None => use the host's local
 # timezone. Kept module-level because _format_msg_timestamp is a free function
 # called where the bot instance isn't in scope.
 _LOCAL_TZ: Optional[ZoneInfo] = None
@@ -291,6 +291,17 @@ class BotConfig:
     spiral_cooldown_minutes: int = 15      # Stay in support mode for this long after spiral
     stressed_cooldown_minutes: int = 10    # Stay elevated for this long after stress
     calm_messages_to_stepdown: int = 3     # Need this many calm messages before stepping down
+    # While a distress window is open in a channel (a spiral within
+    # spiral_cooldown_minutes, or stress within stressed_cooldown_minutes
+    # with the calm counter not yet exhausted), answer the monitored user's
+    # messages there regardless of score. A calm-scoring follow-up one
+    # minute after a spiral otherwise only gets a reply if it pings the bot.
+    followup_after_distress: bool = True
+    # DM the maintainer when a provider returns a billing / balance error
+    # (Anthropic "credit balance is too low", DeepSeek 402 "Insufficient
+    # Balance", DashScope arrears). Once per provider per this many hours.
+    # An account that runs dry mid-conversation otherwise fails silently.
+    billing_alert_cooldown_hours: int = 6
     
     # System prompts are no longer static — they're composed at runtime from
     # the persona config (personas/<bot_persona>.json) plus built-in capability
@@ -312,6 +323,59 @@ def _extract_anthropic_text(response) -> str:
 # =============================================================================
 # MEMORY SYSTEMS
 # =============================================================================
+
+try:
+    from mtg.util import (looks_like_billing_error as is_billing_error,
+                          register_billing_alert_callback)
+except ImportError:  # the MTG engine is optional in this fork
+    import re as _re_billing
+
+    _BILLING_ERROR_RE = _re_billing.compile(
+        r"credit balance|insufficient[ _]balance|insufficient[ _]quota|"
+        r"payment required|arrear|exceeded your current quota|\\bbilling\\b",
+        _re_billing.IGNORECASE,
+    )
+
+    def is_billing_error(exc: BaseException) -> bool:  # type: ignore[misc]
+        """True when an API error is the account running dry, not a transient.
+
+        Text-matched: Anthropic's is an HTTP 400 (``invalid_request_error:
+        Your credit balance is too low``), so a status code cannot classify
+        it. DeepSeek returns 402; DashScope reports arrears.
+        """
+        if getattr(exc, "status_code", None) == 402:
+            return True
+        return bool(_BILLING_ERROR_RE.search(str(exc)))
+
+    def register_billing_alert_callback(name, callback) -> None:  # type: ignore[misc]
+        return None
+
+
+def _age_from_birthdate(birthdate: str, today: Optional[_date] = None) -> Optional[int]:
+    """Whole years since an ISO ``YYYY-MM-DD`` birthdate; None if unparseable.
+
+    A static ``age`` in a memories file rots one year at a time; store
+    ``birthdate`` and let the prompt derive the age.
+    """
+    try:
+        born = _date.fromisoformat(str(birthdate).strip())
+    except (TypeError, ValueError):
+        return None
+    today = today or _date.today()
+    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+
+def _billing_provider_label(model_or_provider: str) -> Tuple[str, str]:
+    """(cooldown key, human label + where to top up) for a model/provider string."""
+    m = (model_or_provider or "").lower()
+    if m.startswith("deepseek") and "dashscope" not in m:
+        return "deepseek", "DeepSeek (platform.deepseek.com)"
+    if "qwen" in m or "dashscope" in m:
+        return "dashscope", "Qwen / DashScope (Alibaba Model Studio console)"
+    if "claude" in m or m == "anthropic":
+        return "anthropic", "Anthropic (console.anthropic.com, Plans & Billing)"
+    return m or "unknown", model_or_provider or "unknown provider"
+
 
 def load_personal_memories(user_id: str) -> Optional[Dict]:
     """Load gitignored personal context for specific users."""
@@ -1241,6 +1305,27 @@ class CompanionBot(commands.Bot):
         self.active_channels: Dict[int, int] = {}  # monitored_user_id -> channel_id
         self.semantic_pending: Dict[int, bool] = defaultdict(bool)  # in-flight Haiku call per user
         self.semantic_triggered: Dict[int, Optional[Tuple[float, bool, str, datetime]]] = {}  # (score, is_spiral, reason, when)
+        # Message ids this bot has ALREADY answered (recorded at the send
+        # chokepoint) and ids it has COMMITTED to answering but not yet sent
+        # (recorded synchronously the moment should_respond is decided). The
+        # classifier's immediate re-dispatch stands down on either; the
+        # in-flight one matters because Haiku (~2s) beats an Opus support
+        # reply (~15s) to that check every time.
+        self.answered_message_ids: deque = deque(maxlen=50)
+        self._responding_message_ids: deque = deque(maxlen=50)
+        # Message ids currently being re-dispatched by the classifier — the
+        # buffer-append skip reads this. Bot-side tracking, NOT an attribute
+        # on the Message: discord.Message uses __slots__.
+        self._redispatch_ids: set = set()
+        # One asyncio.Lock per channel around generate+send, so a burst of
+        # rapid-fire messages is answered in order with each earlier reply
+        # already in context.
+        self._chat_locks: Dict[int, asyncio.Lock] = {}
+        # Billing alerts: provider -> last DM time, and the DM target
+        # (config `maintainer_user_id`, else the application owner).
+        self._billing_alert_last: Dict[str, datetime] = {}
+        self.maintainer_user_id: Optional[int] = None
+        register_billing_alert_callback("discord-dm", self._billing_alert_from_engine)
         
         # Token/cost tracking (loaded from persistent storage)
         self.total_input_tokens: int = 0
@@ -1424,6 +1509,7 @@ class CompanionBot(commands.Bot):
                 # or in threads it owns.
                 raw_monitored = config.get("monitored_users") or []
                 self.monitored_users = [int(uid) for uid in raw_monitored if uid]
+                self.maintainer_user_id = config.get("maintainer_user_id")
                 self.user_name_map = config.get("user_name_map", {})
                 self.excluded_channels = set(config.get("excluded_channels", []))
                 # `bot_persona`: name of a persona file under personas/
@@ -2129,8 +2215,26 @@ class CompanionBot(commands.Bot):
             context_parts = []
             if "name" in memories:
                 context_parts.append(f"Name: {memories['name']}")
+            if "birthdate" in memories:
+                age = _age_from_birthdate(memories["birthdate"])
+                if age is not None:
+                    note = memories.get("birthday_note")
+                    context_parts.append(
+                        f"Age: {age} (born {memories['birthdate']}"
+                        + (f"; {note}" if note else "") + ")")
+            elif "age" in memories:
+                # Legacy static field — rots a year at a time. Prefer birthdate.
+                context_parts.append(
+                    f"Age: {memories['age']} (static field — may be stale)")
             if "background" in memories:
                 context_parts.append(f"Background: {memories['background']}")
+            situation = memories.get("current_situation")
+            if isinstance(situation, dict) and situation.get("notes"):
+                as_of = situation.get("as_of", "unknown date")
+                lines = "\n".join(f"  - {n}" for n in situation["notes"])
+                context_parts.append(
+                    f"Current situation (as of {as_of} — dated facts; ask before "
+                    f"treating anything marked unconfirmed as settled):\n{lines}")
             if "support_notes" in memories:
                 context_parts.append(f"Support approach: {memories['support_notes']}")
             if "interests" in memories:
@@ -2246,7 +2350,92 @@ class CompanionBot(commands.Bot):
         except (FileNotFoundError, json.JSONDecodeError):
             return ""
 
-    async def _classify_distress(self, user_id: int):
+    def _followup_active(self, thread_id: int) -> bool:
+        """Read-only twin of determine_support_level's window logic.
+
+        True while a distress window is open in this channel: a spiral within
+        spiral_cooldown_minutes, or stress within stressed_cooldown_minutes
+        with the calm counter not yet exhausted. Used to answer a monitored
+        user's messages regardless of score for the rest of the window.
+        Deliberately does NOT record history or touch the calm counter;
+        determine_support_level still owns those when the reply is made.
+        """
+        if not CONFIG.followup_after_distress:
+            return False
+        now = datetime.now()
+        history = self.distress_history.get(thread_id, [])
+        spiral_cutoff = now - timedelta(minutes=CONFIG.spiral_cooldown_minutes)
+        if any(sp and t > spiral_cutoff for t, _s, sp in history):
+            return True
+        stress_cutoff = now - timedelta(minutes=CONFIG.stressed_cooldown_minutes)
+        recent_stress = any(s >= CONFIG.distress_threshold and t > stress_cutoff
+                            for t, s, _sp in history)
+        if recent_stress:
+            calm = self.calm_message_count.get(thread_id, 0)
+            return calm < CONFIG.calm_messages_to_stepdown
+        return False
+
+    def _chat_lock_for(self, thread_id: int) -> asyncio.Lock:
+        """One lock per channel around generate+send (see _chat_locks)."""
+        lock = self._chat_locks.get(thread_id)
+        if lock is None:
+            lock = self._chat_locks[thread_id] = asyncio.Lock()
+        return lock
+
+    async def _maybe_billing_alert(self, provider: str, exc: BaseException) -> bool:
+        """DM the maintainer that a provider account ran dry.
+
+        Once per provider per CONFIG.billing_alert_cooldown_hours. Target is
+        config `maintainer_user_id`, else the application owner. Returns True
+        when a DM was actually sent. Never raises — an alert failing must not
+        take a reply down with it.
+        """
+        key, label = _billing_provider_label(provider)
+        now = datetime.now()
+        last = self._billing_alert_last.get(key)
+        if last is not None and (now - last) < timedelta(hours=CONFIG.billing_alert_cooldown_hours):
+            return False
+        self._billing_alert_last[key] = now
+        target = None
+        try:
+            if self.maintainer_user_id:
+                uid = int(self.maintainer_user_id)
+                target = self.get_user(uid) or await self.fetch_user(uid)
+            else:
+                info = await self.application_info()
+                target = getattr(info, "owner", None)
+        except (discord.HTTPException, ValueError, TypeError, AttributeError) as e:
+            print(f"[BILLING-ALERT] Could not resolve the maintainer to DM: {e}")
+            return False
+        if target is None:
+            print("[BILLING-ALERT] No maintainer to DM (set maintainer_user_id in config.json)")
+            return False
+        detail = re.sub(r"\s+", " ", str(exc))[:300]
+        text = (f"🚨 **{label} billing error** at {now:%Y-%m-%d %H:%M} — the account looks "
+                f"out of credit. Until it is topped up, replies that need that provider "
+                f"fail silently.\n`{detail}`\n"
+                f"_(one DM per provider per {CONFIG.billing_alert_cooldown_hours}h)_")
+        try:
+            await target.send(text)
+        except (discord.HTTPException, AttributeError) as e:
+            print(f"[BILLING-ALERT] DM to maintainer failed: {e}")
+            return False
+        print(f"[BILLING-ALERT] DM sent to maintainer for {key}")
+        return True
+
+    def _billing_alert_from_engine(self, provider: str, exc: BaseException) -> None:
+        """mtg.util billing hook — schedules the DM from any thread, never raises."""
+        coro = self._maybe_billing_alert(provider, exc)
+        try:
+            try:
+                asyncio.get_running_loop().create_task(coro)
+            except RuntimeError:
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except Exception as e:  # crash barrier: a failed alert must never break anything
+            coro.close()
+            print(f"[BILLING-ALERT] scheduling failed: {e}")
+
+    async def _classify_distress(self, user_id: int, trigger_message=None):
         """
         Background Haiku classifier for a monitored user's messages.
 
@@ -2255,8 +2444,12 @@ class CompanionBot(commands.Bot):
         indirect distress language that keywords miss (novel metaphors,
         self-punishment fantasies, subtle self-worth negation).
 
-        Sets self.semantic_triggered[user_id] if distress is detected.
-        Result is consumed on the monitored user's NEXT message in on_message.
+        On a flag-worthy score this RESPONDS IMMEDIATELY to the triggering
+        message by re-dispatching it through on_message. The armed flag
+        (self.semantic_triggered[user_id], consumed on the user's NEXT
+        message) is kept as the fallback when the re-dispatch fails. It
+        stands down entirely — no flag, no dispatch — when the trigger was
+        already answered by the normal path, or is in flight there.
         """
         if self.semantic_pending.get(user_id, False):
             return
@@ -2343,13 +2536,45 @@ class CompanionBot(commands.Bot):
             print(f"[SEMANTIC] Result: score={score:.1f}, spiral={is_spiral}, reason=\"{reason}\"")
 
             if score >= CONFIG.semantic_distress_threshold:
+                _tid = (getattr(trigger_message, 'id', None)
+                        if trigger_message is not None else None)
+                if _tid is not None and (
+                        _tid in self.answered_message_ids
+                        or _tid in self._responding_message_ids):
+                    print("[SEMANTIC] Trigger message already answered or "
+                          "in flight — standing down (no flag, no dispatch)")
+                    return
                 self.semantic_triggered[user_id] = (score, is_spiral, reason, datetime.now())
                 print(f"[SEMANTIC] Flagged for proactive response on next message")
+                # Respond to the flagged message ITSELF. Re-dispatching through
+                # on_message reuses the whole pipeline — the flag consumer,
+                # keyword merge, support-level model selection, PluralKit
+                # dedup — exactly as if the next message had arrived. Loop-safe:
+                # the consumer nulls the flag before any await, and the
+                # classifier-fire check inside the re-entry sees
+                # semantic_pending still True (the finally has not run yet).
+                if trigger_message is not None:
+                    try:
+                        print(f"[SEMANTIC] Responding immediately to the flagged message")
+                        if _tid is not None:
+                            self._redispatch_ids.add(_tid)
+                        try:
+                            await self.on_message(trigger_message)
+                        finally:
+                            self._redispatch_ids.discard(_tid)
+                    except Exception as e:
+                        print(f"[SEMANTIC] Immediate response failed ({e}) — "
+                              f"the armed flag stays as the next-message fallback")
 
         except json.JSONDecodeError as e:
             print(f"[SEMANTIC] JSON parse error: {e} - raw: {result_text[:100]}")
         except Exception as e:
             print(f"[SEMANTIC] Classifier error: {e}")
+            # An account that ran dry mid-conversation: this branch is the
+            # only witness, so tell the maintainer.
+            _alert = getattr(self, '_maybe_billing_alert', None)
+            if _alert is not None and is_billing_error(e):
+                await _alert("anthropic", e)
         finally:
             self.semantic_pending[user_id] = False
 
@@ -3003,6 +3228,16 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
         is_monitored = message.author.id in self.monitored_users
         monitored_uid = message.author.id if is_monitored else None
 
+        # Needed BEFORE the classifier launch below. A message the bot will
+        # answer anyway — a reply that pings the bot, a bot-owned thread, the
+        # MTG channel — must not also spawn a classifier whose re-dispatch
+        # produces a second reply.
+        is_mentioned = self.user.mentioned_in(message)
+        is_bot_thread = (
+            isinstance(message.channel, discord.Thread) and
+            message.channel.owner_id == self.user.id
+        )
+
         # Check for distress BEFORE deciding whether to respond
         # (needed to decide if we should proactively respond to a monitored user)
         text_content = message.content or ""
@@ -3022,7 +3257,11 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
                 self.active_channels[monitored_uid] = channel_id
                 # Use the configured display name from user_name_map when present
                 buf_name = self.user_name_map.get(str(monitored_uid), author_name)
-                self.message_buffers[monitored_uid].append((now, buf_name, text_content))
+                # The classifier's re-dispatch runs the SAME message through
+                # on_message again — without this skip it re-enters the
+                # buffer and inflates the next Haiku window.
+                if getattr(message, 'id', None) not in self._redispatch_ids:
+                    self.message_buffers[monitored_uid].append((now, buf_name, text_content))
             else:
                 # Someone else: buffer into ANY monitored user's active channel
                 # that matches the current channel (so context flows naturally
@@ -3042,6 +3281,7 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
         # === Per-user: semantic classifier + sub-threshold accumulator ===
         monitored_accumulated = False
         monitored_semantic = False
+        monitored_followup = False
         if is_monitored and text_content:
 
             # Check if a PREVIOUS background Haiku call flagged distress
@@ -3077,13 +3317,30 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
                     print(f"💭 [ACCUMULATOR] {user_label} sub-threshold accumulation triggered "
                           f"(total: {accumulated_total:.2f} from {len(self.score_accumulators[monitored_uid])} messages)")
 
+            # Inside an open distress window, answer regardless of score (see
+            # CONFIG.followup_after_distress). And never launch the classifier
+            # for a message this handler will answer anyway — its only output
+            # is a second dispatch.
+            monitored_followup = self._followup_active(channel_id)
+            will_respond_anyway = bool(
+                is_mtg_channel or is_mentioned or is_bot_thread
+                or monitored_followup or monitored_semantic
+            )
+            if monitored_followup and not (is_distressed or monitored_semantic
+                                           or monitored_accumulated):
+                print("💭 [FOLLOW-UP] monitored user is inside a distress window — "
+                      "answering regardless of score")
+
             # Fire background Haiku classifier when keywords found nothing
-            # but we have enough messages in the buffer to analyze context
-            if (distress_score == 0
+            # conclusive. The gate is SUB-THRESHOLD, not zero: a lone weak
+            # keyword must not suppress the semantic look entirely.
+            if (distress_score < CONFIG.distress_threshold
+                    and not is_distressed
                     and not monitored_accumulated
+                    and not will_respond_anyway
                     and not self.semantic_pending.get(monitored_uid, False)
                     and len(self.message_buffers.get(monitored_uid, [])) >= 1):
-                asyncio.create_task(self._classify_distress(monitored_uid))
+                asyncio.create_task(self._classify_distress(monitored_uid, message))
 
         # Determine if we should respond
         # Priority order:
@@ -3093,13 +3350,9 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
         # 4. A monitored user is distressed (keyword, accumulator, or semantic): proactively respond
         # 5. Otherwise: don't respond
 
-        is_mentioned = self.user.mentioned_in(message)
-        is_bot_thread = (
-            isinstance(message.channel, discord.Thread) and
-            message.channel.owner_id == self.user.id
-        )
         monitored_needs_support = is_monitored and (
             is_distressed or is_spiral or monitored_accumulated or monitored_semantic
+            or monitored_followup
         )
 
         should_respond = (
@@ -3111,6 +3364,9 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
 
         if not should_respond:
             return
+
+        # Commit BEFORE the first await (see _responding_message_ids).
+        self._responding_message_ids.append(message.id)
 
         # === PluralKit proxy dedup ===
         # PluralKit listens for messages matching a system's proxy tags (like
@@ -3191,274 +3447,290 @@ Notes fade after ~48 hours unless referenced, so jot down anything that seems im
             if distress_score > 0:
                 print(f"✅ Normal mode despite score {distress_score:.2f} - {reason}")
         
-        # Build conversation context
-        # Simplify if just text
-        if len(content_parts) == 1 and content_parts[0]["type"] == "text":
-            self.conversations[thread_id].append({
-                "role": "user",
-                "content": content_parts[0]["text"]
-            })
-        else:
-            self.conversations[thread_id].append({
-                "role": "user",
-                "content": content_parts
-            })
+        # Serialize generate+send per channel (see _chat_locks). The user-turn
+        # append lives INSIDE the lock on purpose: appending first and locking
+        # later would let a queued handler's API call see the conversation
+        # ending on an assistant turn.
+        async with self._chat_lock_for(thread_id):
+            # Build conversation context
+            # Simplify if just text
+            if len(content_parts) == 1 and content_parts[0]["type"] == "text":
+                self.conversations[thread_id].append({
+                    "role": "user",
+                    "content": content_parts[0]["text"]
+                })
+            else:
+                self.conversations[thread_id].append({
+                    "role": "user",
+                    "content": content_parts
+                })
         
-        # Trim old messages
-        if len(self.conversations[thread_id]) > CONFIG.max_messages_per_thread:
-            self.conversations[thread_id] = self.conversations[thread_id][-CONFIG.max_messages_per_thread:]
+            # Trim old messages
+            if len(self.conversations[thread_id]) > CONFIG.max_messages_per_thread:
+                self.conversations[thread_id] = self.conversations[thread_id][-CONFIG.max_messages_per_thread:]
         
-        # Fetch environment context (time/weather) - runs async, cached
-        environment = await self.get_environment_context()
+            # Fetch environment context (time/weather) - runs async, cached
+            environment = await self.get_environment_context()
         
-        # Get MTG game context if we're in an MTG thread
-        game_context = None
-        if is_mtg_channel:
-            game_context = self._get_game_context_for_chat(channel_id)
+            # Get MTG game context if we're in an MTG thread
+            game_context = None
+            if is_mtg_channel:
+                game_context = self._get_game_context_for_chat(channel_id)
         
-        # Generate response
-        async with message.channel.typing():
-            try:
-                # Run in thread pool to avoid blocking Discord's event loop
-                # Tool list:
-                #   - web_search (server-side, Anthropic-managed) — fetches web content
-                #   - read_game_log (client-side, ours) — greps paired console+discord
-                #     logs for any past MTG game so the bot can fact-check itself
-                #     when asked about specific game events / bugs.
-                tool_list = []
-                if CONFIG.web_search_enabled:
-                    tool_list.append({"type": "web_search_20250305", "name": "web_search"})
-                # Game-log tool only when we're in an MTG-aware context
-                if is_mtg_channel:
-                    tool_list.append(self.GAME_LOG_TOOL_SCHEMA)
+            # Generate response
+            async with message.channel.typing():
+                try:
+                    # Run in thread pool to avoid blocking Discord's event loop
+                    # Tool list:
+                    #   - web_search (server-side, Anthropic-managed) — fetches web content
+                    #   - read_game_log (client-side, ours) — greps paired console+discord
+                    #     logs for any past MTG game so the bot can fact-check itself
+                    #     when asked about specific game events / bugs.
+                    tool_list = []
+                    if CONFIG.web_search_enabled:
+                        tool_list.append({"type": "web_search_20250305", "name": "web_search"})
+                    # Game-log tool only when we're in an MTG-aware context
+                    if is_mtg_channel:
+                        tool_list.append(self.GAME_LOG_TOOL_SCHEMA)
 
-                # Bookclub: if a work is loaded for this channel (or its parent),
-                # inject it as a prompt-cached system block so the whole text rides
-                # in the model's 1M context (bypassing the 30k history trim), and —
-                # outside distress — optionally use the deeper bookclub model.
-                system = self.build_system_prompt(
-                    message.author, distress_level, environment, game_context, message=message
-                )
-                book = self.reading_materials.get(channel_id) or (
-                    self.reading_materials.get(parent_id) if parent_id else None
-                )
-                if book is not None:
-                    fic_block = (
-                        f"You're in a bookclub discussion of '{book.title}'"
-                        + (f" (source: {book.url})" if book.url else "")
-                        + ". The full text follows between the markers — treat it as "
-                        "canonical source material: reference specific passages, "
-                        "characters, and plot points freely, and consider any question "
-                        "about the work answered by the text itself.\n"
-                        f"--- BEGIN WORK ---\n{book.text}\n--- END WORK ---"
+                    # Bookclub: if a work is loaded for this channel (or its parent),
+                    # inject it as a prompt-cached system block so the whole text rides
+                    # in the model's 1M context (bypassing the 30k history trim), and —
+                    # outside distress — optionally use the deeper bookclub model.
+                    system = self.build_system_prompt(
+                        message.author, distress_level, environment, game_context, message=message
                     )
-                    system = [
-                        {"type": "text", "text": fic_block,
-                         "cache_control": {"type": "ephemeral"}},
-                        {"type": "text", "text": system},
-                    ]
-                    if distress_level == "none" and CONFIG.bookclub_model:
-                        model = CONFIG.bookclub_model
-                    max_tokens = max(max_tokens, CONFIG.bookclub_reply_max_tokens)
+                    book = self.reading_materials.get(channel_id) or (
+                        self.reading_materials.get(parent_id) if parent_id else None
+                    )
+                    if book is not None:
+                        fic_block = (
+                            f"You're in a bookclub discussion of '{book.title}'"
+                            + (f" (source: {book.url})" if book.url else "")
+                            + ". The full text follows between the markers — treat it as "
+                            "canonical source material: reference specific passages, "
+                            "characters, and plot points freely, and consider any question "
+                            "about the work answered by the text itself.\n"
+                            f"--- BEGIN WORK ---\n{book.text}\n--- END WORK ---"
+                        )
+                        system = [
+                            {"type": "text", "text": fic_block,
+                             "cache_control": {"type": "ephemeral"}},
+                            {"type": "text", "text": system},
+                        ]
+                        if distress_level == "none" and CONFIG.bookclub_model:
+                            model = CONFIG.bookclub_model
+                        max_tokens = max(max_tokens, CONFIG.bookclub_reply_max_tokens)
 
-                response = await asyncio.to_thread(
-                    self.claude.messages.create,
-                    model=model,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=self.conversations[thread_id],
-                    tools=tool_list
-                )
-
-                # Handle tool use loop — supports both server-side (web_search)
-                # and client-side (read_game_log) tools.
-                reply_text = ""
-                urls_found = []
-
-                while response.stop_reason == "tool_use":
-                    # Collect any text so far
-                    for block in response.content:
-                        if hasattr(block, 'text'):
-                            reply_text += block.text
-
-                    # Extract tool use blocks
-                    tool_uses = [block for block in response.content if block.type == "tool_use"]
-
-                    # Process tool results — different tools return different content
-                    tool_results = []
-                    for tool_use in tool_uses:
-                        if tool_use.name == "read_game_log":
-                            try:
-                                content = await self._read_game_log_tool(channel_id, tool_use.input)
-                            except Exception as e:
-                                content = f"ERROR running read_game_log: {e}"
-                            # Cap content size — Discord is fine but the API
-                            # bills these tokens. 12KB ≈ 3000 tokens which is
-                            # plenty for a focused grep result.
-                            if len(content) > 12000:
-                                content = content[:12000] + "\n... [output truncated to 12KB]"
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": content,
-                            })
-                        else:
-                            # Server-side tools (web_search) are completed by
-                            # the API itself; we just acknowledge.
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": "Search completed"
-                            })
-
-                    # Track usage from this call
-                    if hasattr(response, 'usage'):
-                        self.total_input_tokens += response.usage.input_tokens
-                        self.total_output_tokens += response.usage.output_tokens
-                        self.api_calls += 1
-
-                    # Continue conversation with tool results. Pass system=system
-                    # (carrying the cached bookclub fic + persona) and the prior
-                    # history so the answer-producing call isn't blind to the loaded
-                    # work or the user's question. The fic block is cache_control'd,
-                    # so re-sending it is a cheap cache read.
                     response = await asyncio.to_thread(
                         self.claude.messages.create,
                         model=model,
                         max_tokens=max_tokens,
                         system=system,
-                        messages=[
-                            *self.conversations[thread_id],
-                            {"role": "assistant", "content": response.content},
-                            {"role": "user", "content": tool_results}
-                        ],
+                        messages=self.conversations[thread_id],
                         tools=tool_list
                     )
-                
-                # Extract final text
-                for block in response.content:
-                    if hasattr(block, 'text'):
-                        reply_text += block.text
-                
-                # Extract URLs from response for embed
-                url_pattern = r'https?://[^\s\)\]<>\"\']+[^\s\.\,\)\]<>\"\':]'
-                urls_found = list(set(re.findall(url_pattern, reply_text)))
-                
-                reply = reply_text
-                
-                # Track token usage
-                if hasattr(response, 'usage'):
-                    self.total_input_tokens += response.usage.input_tokens
-                    self.total_output_tokens += response.usage.output_tokens
-                    self.api_calls += 1
-                    if model == CONFIG.model_support:
-                        self.opus_input_tokens += response.usage.input_tokens
-                        self.opus_output_tokens += response.usage.output_tokens
-                    else:
-                        self.sonnet_input_tokens += response.usage.input_tokens
-                        self.sonnet_output_tokens += response.usage.output_tokens
-                    self._save_persistent_costs()
-                
-                # Handle empty response
-                if not reply:
-                    await message.channel.send("I received an empty response. Try again?")
-                    return
-                
-                # Extract and process working memory notes.
-                # May 14 audit: user reported notes being recorded less often
-                # lately. Make the matcher case-insensitive (Claude sometimes
-                # emits `[Note: ...]` or `[NOTE: ...]`) and accept the common
-                # variants `[note ...]`, `[memory: ...]`, `[remember: ...]`
-                # so a slight formatting drift doesn't drop the capture.
-                note_pattern = re.compile(
-                    r'\[(?:note|memory|remember)\s*[:|]\s*([^:|]+)\s*[:|]\s*([^\]]+)\]',
-                    re.IGNORECASE,
-                )
-                memory = self.get_memory(message.author.id)
-                notes_added = []
-                for match in note_pattern.finditer(reply):
-                    key = match.group(1).strip()
-                    value = match.group(2).strip()
-                    memory.working.add(key, value)
-                    notes_added.append(key)
 
-                # Remove note markers from visible response
-                reply = note_pattern.sub('', reply)
-                
-                # Strip timestamps Claude may have echoed back (e.g. "[Mar 22, 2:15 AM]")
-                # These are for Claude's context only — Discord shows its own timestamps
-                reply = re.sub(r'\[(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*', '', reply)
+                    # Handle tool use loop — supports both server-side (web_search)
+                    # and client-side (read_game_log) tools.
+                    reply_text = ""
+                    urls_found = []
 
-                # Clean up any double spaces or weird formatting from removed tags
-                reply = re.sub(r'\n\s*\n\s*\n', '\n\n', reply)
-                reply = re.sub(r'  +', ' ', reply).strip()
+                    while response.stop_reason == "tool_use":
+                        # Collect any text so far
+                        for block in response.content:
+                            if hasattr(block, 'text'):
+                                reply_text += block.text
+
+                        # Extract tool use blocks
+                        tool_uses = [block for block in response.content if block.type == "tool_use"]
+
+                        # Process tool results — different tools return different content
+                        tool_results = []
+                        for tool_use in tool_uses:
+                            if tool_use.name == "read_game_log":
+                                try:
+                                    content = await self._read_game_log_tool(channel_id, tool_use.input)
+                                except Exception as e:
+                                    content = f"ERROR running read_game_log: {e}"
+                                # Cap content size — Discord is fine but the API
+                                # bills these tokens. 12KB ≈ 3000 tokens which is
+                                # plenty for a focused grep result.
+                                if len(content) > 12000:
+                                    content = content[:12000] + "\n... [output truncated to 12KB]"
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use.id,
+                                    "content": content,
+                                })
+                            else:
+                                # Server-side tools (web_search) are completed by
+                                # the API itself; we just acknowledge.
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use.id,
+                                    "content": "Search completed"
+                                })
+
+                        # Track usage from this call
+                        if hasattr(response, 'usage'):
+                            self.total_input_tokens += response.usage.input_tokens
+                            self.total_output_tokens += response.usage.output_tokens
+                            self.api_calls += 1
+
+                        # Continue conversation with tool results. Pass system=system
+                        # (carrying the cached bookclub fic + persona) and the prior
+                        # history so the answer-producing call isn't blind to the loaded
+                        # work or the user's question. The fic block is cache_control'd,
+                        # so re-sending it is a cheap cache read.
+                        response = await asyncio.to_thread(
+                            self.claude.messages.create,
+                            model=model,
+                            max_tokens=max_tokens,
+                            system=system,
+                            messages=[
+                                *self.conversations[thread_id],
+                                {"role": "assistant", "content": response.content},
+                                {"role": "user", "content": tool_results}
+                            ],
+                            tools=tool_list
+                        )
                 
-                # Save memories if any notes were added
-                if notes_added:
-                    await self.save_memories_async()
+                    # Extract final text
+                    for block in response.content:
+                        if hasattr(block, 'text'):
+                            reply_text += block.text
                 
-                # Store assistant response (cleaned version, with timestamp)
-                ts = _format_msg_timestamp(datetime.now(timezone.utc))
-                self.conversations[thread_id].append({
-                    "role": "assistant",
-                    "content": f"{ts} {reply}"
-                })
+                    # Extract URLs from response for embed
+                    url_pattern = r'https?://[^\s\)\]<>\"\']+[^\s\.\,\)\]<>\"\':]'
+                    urls_found = list(set(re.findall(url_pattern, reply_text)))
                 
-                # Extract code files if any
-                reply, files = self._extract_code_files(reply)
+                    reply = reply_text
                 
-                # Send reply (handle Discord character limit)
-                await self._send_response(message.channel, reply, files)
+                    # Track token usage
+                    if hasattr(response, 'usage'):
+                        self.total_input_tokens += response.usage.input_tokens
+                        self.total_output_tokens += response.usage.output_tokens
+                        self.api_calls += 1
+                        if model == CONFIG.model_support:
+                            self.opus_input_tokens += response.usage.input_tokens
+                            self.opus_output_tokens += response.usage.output_tokens
+                        else:
+                            self.sonnet_input_tokens += response.usage.input_tokens
+                            self.sonnet_output_tokens += response.usage.output_tokens
+                        self._save_persistent_costs()
                 
-                # Send source URL embed if any URLs were found from web search
-                if urls_found:
-                    embed = discord.Embed(
-                        title="🔍 Sources",
-                        color=discord.Color.blue()
+                    # Handle empty response
+                    if not reply:
+                        await message.channel.send("I received an empty response. Try again?")
+                        return
+                
+                    # Extract and process working memory notes.
+                    # May 14 audit: user reported notes being recorded less often
+                    # lately. Make the matcher case-insensitive (Claude sometimes
+                    # emits `[Note: ...]` or `[NOTE: ...]`) and accept the common
+                    # variants `[note ...]`, `[memory: ...]`, `[remember: ...]`
+                    # so a slight formatting drift doesn't drop the capture.
+                    note_pattern = re.compile(
+                        r'\[(?:note|memory|remember)\s*[:|]\s*([^:|]+)\s*[:|]\s*([^\]]+)\]',
+                        re.IGNORECASE,
                     )
-                    for i, url in enumerate(urls_found[:CONFIG.max_search_results_in_embed], 1):
-                        display_url = url[:60] + "..." if len(url) > 60 else url
-                        embed.add_field(
-                            name=f"Source {i}",
-                            value=f"[{display_url}]({url})",
-                            inline=False
-                        )
-                    await message.channel.send(embed=embed)
+                    memory = self.get_memory(message.author.id)
+                    notes_added = []
+                    for match in note_pattern.finditer(reply):
+                        key = match.group(1).strip()
+                        value = match.group(2).strip()
+                        memory.working.add(key, value)
+                        notes_added.append(key)
+
+                    # Remove note markers from visible response
+                    reply = note_pattern.sub('', reply)
                 
-                # If distress is high enough, also offer comfort content
-                # Uses the same image pipeline as !panda — actual pictures, not web search text walls
-                if offer_comfort:
-                    await asyncio.sleep(1)  # Brief pause before comfort content
-                    image_url, fact, source = await self.web_search.fetch_red_panda_image()
-                    if image_url:
+                    # Strip timestamps Claude may have echoed back (e.g. "[Mar 22, 2:15 AM]")
+                    # These are for Claude's context only — Discord shows its own timestamps
+                    reply = re.sub(r'\[(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*', '', reply)
+
+                    # Clean up any double spaces or weird formatting from removed tags
+                    reply = re.sub(r'\n\s*\n\s*\n', '\n\n', reply)
+                    reply = re.sub(r'  +', ' ', reply).strip()
+                
+                    # Save memories if any notes were added
+                    if notes_added:
+                        await self.save_memories_async()
+                
+                    # Store assistant response (cleaned version, with timestamp)
+                    ts = _format_msg_timestamp(datetime.now(timezone.utc))
+                    self.conversations[thread_id].append({
+                        "role": "assistant",
+                        "content": f"{ts} {reply}"
+                    })
+                
+                    # Extract code files if any
+                    reply, files = self._extract_code_files(reply)
+                
+                    # Send reply (handle Discord character limit)
+                    await self._send_response(message.channel, reply, files)
+                    # The classifier's stand-down check reads this.
+                    self.answered_message_ids.append(message.id)
+                
+                    # Send source URL embed if any URLs were found from web search
+                    if urls_found:
                         embed = discord.Embed(
-                            title="\U0001f43c Here's something cute",
-                            color=discord.Color.orange()
+                            title="🔍 Sources",
+                            color=discord.Color.blue()
                         )
-                        embed.set_image(url=image_url)
-                        if fact:
-                            embed.description = f"*{fact}*"
-                        intro = random.choice([
-                            "*perks up* Oh! Here, look at this:",
-                            "*nudges you gently* Hey, look:",
-                            "*soft chirp* Found a friend:",
-                            "*tail swishes* Here, this might help:",
-                        ])
-                        await message.channel.send(intro, embed=embed)
-                    else:
-                        # All image APIs failed — send a text fact instead of nothing
-                        await message.channel.send(
-                            "*nudges you gently* Red pandas wrap their fluffy tails around themselves like blankets to stay warm! \U0001f43c"
-                        )
+                        for i, url in enumerate(urls_found[:CONFIG.max_search_results_in_embed], 1):
+                            display_url = url[:60] + "..." if len(url) > 60 else url
+                            embed.add_field(
+                                name=f"Source {i}",
+                                value=f"[{display_url}]({url})",
+                                inline=False
+                            )
+                        await message.channel.send(embed=embed)
                 
-            except anthropic.APIError as e:
-                print(f"API Error: {e}")
-                await message.channel.send(f"❌ API Error: {e}")
-            except Exception as e:
-                print(f"Error generating response: {e}")
-                await message.channel.send(
-                    "Sorry, I had trouble generating a response. Try again?"
-                )
+                    # If distress is high enough, also offer comfort content
+                    # Uses the same image pipeline as !panda — actual pictures, not web search text walls
+                    if offer_comfort:
+                        await asyncio.sleep(1)  # Brief pause before comfort content
+                        image_url, fact, source = await self.web_search.fetch_red_panda_image()
+                        if image_url:
+                            embed = discord.Embed(
+                                title="\U0001f43c Here's something cute",
+                                color=discord.Color.orange()
+                            )
+                            embed.set_image(url=image_url)
+                            if fact:
+                                embed.description = f"*{fact}*"
+                            intro = random.choice([
+                                "*perks up* Oh! Here, look at this:",
+                                "*nudges you gently* Hey, look:",
+                                "*soft chirp* Found a friend:",
+                                "*tail swishes* Here, this might help:",
+                            ])
+                            await message.channel.send(intro, embed=embed)
+                        else:
+                            # All image APIs failed — send a text fact instead of nothing
+                            await message.channel.send(
+                                "*nudges you gently* Red pandas wrap their fluffy tails around themselves like blankets to stay warm! \U0001f43c"
+                            )
+                
+                except anthropic.APIError as e:
+                    print(f"API Error: {e}")
+                    if is_billing_error(e):
+                        # The account ran dry: DM the maintainer and keep the raw
+                        # billing text out of the channel.
+                        await self._maybe_billing_alert("anthropic", e)
+                        await message.channel.send(
+                            "I can't reach my language model right now — it's a "
+                            "billing issue on my end, not you. The maintainer has "
+                            "been notified. I'm still here.")
+                    else:
+                        await message.channel.send(f"❌ API Error: {e}")
+                except Exception as e:
+                    print(f"Error generating response: {e}")
+                    await message.channel.send(
+                        "Sorry, I had trouble generating a response. Try again?"
+                    )
     
     async def _process_message_content(
         self,

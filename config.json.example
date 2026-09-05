@@ -1,6 +1,7 @@
 {
   "mtg_channel_id": null,
   "monitored_users": [],
+  "maintainer_user_id": null,
   "user_name_map": {},
   "excluded_channels": [],
   "plural_systems": {},
@@ -17,6 +18,7 @@
   "_comments": {
     "mtg_channel_id": "Channel ID where MTG games are played. Bot responds to EVERY message here. Set to null to allow games anywhere.",
     "monitored_users": "List of Discord user IDs to proactively support. The bot responds when one of these users seems distressed, even without being mentioned. Empty by default — opt in only the users you intend to watch.",
+    "maintainer_user_id": "Discord user ID to DM when an API provider returns a billing/balance error (Anthropic credit exhausted, DeepSeek 402, DashScope arrears) — an account that runs dry mid-conversation otherwise fails silently. Optional: when null the bot DMs the application owner.",
     "user_name_map": "Maps Discord user IDs to memory file names (without .json). The bot loads memories/[name].json for personalized context.",
     "excluded_channels": "Channel IDs where the bot should NEVER respond (even to commands). Useful if another bot owns that channel.",
     "plural_systems": "Maps alter display names (lowercase) to a short prose hint about their system. Used when a PluralKit webhook proxy posts: the bot injects the hint into the system prompt so it understands which alters belong to which system. Example: {\"alex\": \"part of a plural system; Alex is one alter\", \"sam\": \"part of the same system\"}. Leave empty if no plural users on your server — the bot will fall back to a generic plurality-aware note when it sees any PluralKit proxy.",
