@@ -53,13 +53,38 @@ class _ContentBlock:
         self.text = text
 
 
-class _Usage:
-    """Mimics anthropic.types.Usage with .input_tokens and .output_tokens."""
-    __slots__ = ('input_tokens', 'output_tokens')
+def _cache_hit_tokens(usage) -> int:
+    """Prompt-cache hits in an OpenAI-style usage block: DeepSeek's own
+    `prompt_cache_hit_tokens` if non-zero, else the OpenAI-standard
+    `prompt_tokens_details.cached_tokens`. Never summed (DeepSeek can send
+    both for the same hits); missing / None → 0."""
+    def field(obj, name):
+        if obj is None:
+            return None
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    for val in (field(usage, 'prompt_cache_hit_tokens'),
+                field(field(usage, 'prompt_tokens_details'), 'cached_tokens')):
+        try:
+            if val and int(val) > 0:
+                return int(val)
+        except (TypeError, ValueError):
+            pass
+    return 0
 
-    def __init__(self, prompt_tokens: int, completion_tokens: int):
+
+class _Usage:
+    """Mimics anthropic.types.Usage with .input_tokens and .output_tokens.
+
+    `prompt_cache_hit_tokens` is the cached SUBSET of input_tokens (DeepSeek
+    semantics — NOT Anthropic's separate cache_read_input_tokens, so never add
+    it to input_tokens). Used by the V4.1 Flash cost bucket; 0 if unknown."""
+    __slots__ = ('input_tokens', 'output_tokens', 'prompt_cache_hit_tokens')
+
+    def __init__(self, prompt_tokens: int, completion_tokens: int,
+                 cache_hit_tokens: int = 0):
         self.input_tokens = prompt_tokens
         self.output_tokens = completion_tokens
+        self.prompt_cache_hit_tokens = cache_hit_tokens
 
 
 class _AdaptedResponse:
@@ -90,6 +115,7 @@ class _AdaptedResponse:
         self.usage = _Usage(
             prompt_tokens=openai_response.usage.prompt_tokens,
             completion_tokens=openai_response.usage.completion_tokens,
+            cache_hit_tokens=_cache_hit_tokens(openai_response.usage),
         )
 
 
@@ -260,6 +286,7 @@ class _StreamingResponse:
         return _Usage(
             prompt_tokens=getattr(self._final_usage, 'prompt_tokens', 0),
             completion_tokens=getattr(self._final_usage, 'completion_tokens', 0),
+            cache_hit_tokens=_cache_hit_tokens(self._final_usage),
         )
 
     @property
@@ -284,18 +311,17 @@ class _MessagesNamespace:
     all the MTG engine uses), so no message translation is needed.
     """
 
-    def __init__(self, openai_client, default_model: str = "deepseek-v4-flash",
+    def __init__(self, openai_client, default_model: str = "deepseek-flash",
                  log_tag: str = "DEEPSEEK",
                  thinking_enabled: bool = None,
                  reasoning_effort: str = None):
         self._client = openai_client
         self._default_model = default_model
         self._log_tag = log_tag
-        # DeepSeek V4: explicit thinking-mode control. When None, the server
-        # default applies (V4-Flash and V4-Pro both default to thinking
-        # enabled). The actor explicitly sets False to keep JSON output fast;
-        # the strategist leaves it None and relies on V4-Pro's default
-        # plus reasoning_effort="high".
+        # DeepSeek V4.x: explicit thinking-mode control. When None, the server
+        # default applies (V4.1 Flash defaults to thinking enabled). The actor
+        # explicitly sets False to keep JSON output fast; the strategist leaves
+        # it None and relies on the default plus reasoning_effort="medium".
         self._thinking_enabled = thinking_enabled
         self._reasoning_effort = reasoning_effort
         self._call_count = 0
@@ -509,7 +535,7 @@ class OpenAICompatibleAdapter:
     """
 
     def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com",
-                 model: str = "deepseek-v4-flash", log_tag: str = "DEEPSEEK",
+                 model: str = "deepseek-flash", log_tag: str = "DEEPSEEK",
                  extra_headers: dict = None,
                  thinking_enabled: bool = None,
                  reasoning_effort: str = None):
@@ -567,19 +593,20 @@ DeepseekAdapter = OpenAICompatibleAdapter
 # ---------------------------------------------------------------------------
 
 def create_deepseek_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | None':
-    """Create an adapter for DeepSeek (V4-Flash, non-thinking) if available.
+    """Create an adapter for DeepSeek (V4.1 Flash, non-thinking) if available.
 
-    Defaults to deepseek-v4-flash with thinking mode explicitly DISABLED —
-    this is the Actor in the parallel CoT split: 3-5 fast JSON action plans
-    per turn. For the Strategist (deep reasoning, once per turn), use
-    create_deepseek_reasoner_adapter() instead.
+    Defaults to deepseek-flash (V4.1 Flash, released 2026-09-10) with thinking
+    mode explicitly DISABLED — this is the Actor in the parallel CoT split: 3-5
+    fast JSON action plans per turn. For the Strategist (deep reasoning, once
+    per turn), use create_deepseek_reasoner_adapter() instead.
 
-    V4-Flash defaults to thinking mode ENABLED on the server side, so we MUST
+    V4.1 Flash defaults to thinking mode ENABLED on the server side, so we MUST
     set thinking_enabled=False here or the actor will silently get expensive
     chain-of-thought tokens we don't want.
 
-    The legacy aliases `deepseek-chat` and `deepseek-reasoner` are deprecated
-    on July 24, 2026 — V4-Flash + V4-Pro are the canonical model strings now.
+    `deepseek-flash` is the canonical name since 2026-09; the older
+    `deepseek-v4-flash` still resolves to it (and `deepseek-chat` /
+    `deepseek-reasoner` were retired 2026-07-24).
 
     Returns None (not an error) if:
     - No API key provided and DEEPSEEK_API_KEY env var not set
@@ -594,7 +621,7 @@ def create_deepseek_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | N
     try:
         return OpenAICompatibleAdapter(
             api_key=key,
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             log_tag="DEEPSEEK",
             thinking_enabled=False,  # actor: fast JSON, no chain-of-thought
         )
@@ -641,11 +668,16 @@ def create_openrouter_adapter(model: str = "openrouter/optimus-alpha",
 
 
 def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | None':
-    """Create a DeepSeek adapter for the Strategist role (V4-Pro + high reasoning).
+    """Create a DeepSeek adapter for the Strategist role (V4.1 Flash + reasoning).
 
-    Uses deepseek-v4-pro (1.6T MoE, 49B activated) with reasoning_effort=high.
-    V4-Pro defaults to thinking mode enabled on the server side, so we don't
-    pass thinking_enabled explicitly — the default is what we want.
+    Uses deepseek-flash (V4.1 Flash) with thinking on and reasoning_effort=
+    medium. Moved off deepseek-v4-pro 2026-09-21: DeepSeek's own benchmarks put
+    V4.1 Flash ahead of V4 Pro on every coding/agent task (Pro keeps a small
+    edge on GPQA/HLE) at ~1/4 the price, and V4 Pro is being phased out.
+    Verified live with these exact settings the same day. V4.1 Flash defaults
+    to thinking enabled on the server side, so we don't pass thinking_enabled
+    explicitly — the default is what we want. (If memo length/compliance
+    shifts vs the May 23 V4-Pro baseline, re-tune reasoning_effort below.)
 
     Intended for the Strategist in the parallel CoT split: deep reasoning
     fires once per turn, output is a free-text strategy memo (not JSON),
@@ -654,7 +686,7 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
     Function name kept as `_reasoner_adapter` for backward compatibility with
     existing call sites (mtg.cog._deepseek_reasoner_adapter, mtg.autoplay
     swap block). The role is "deep-reasoning strategist"; the underlying
-    model is now V4-Pro instead of the deprecated deepseek-reasoner alias.
+    model is now V4.1 Flash (previously V4-Pro, before that deepseek-reasoner).
 
     Falls back gracefully to None if DEEPSEEK_API_KEY is not set.
     """
@@ -664,7 +696,7 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
     try:
         return OpenAICompatibleAdapter(
             api_key=key,
-            model="deepseek-v4-pro",
+            model="deepseek-flash",
             log_tag="DEEPSEEK:REASONER",
             # May 23 audit (CRITICAL #7): dropped from "high" → "medium" after
             # the May 23 batch showed only 54.7% labeled-memo compliance (target
@@ -673,7 +705,7 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
             # ignoring the "Aim for ~800 max" framing. Deadman fires were 0
             # in May 23 so we have headroom to reduce effort.
             reasoning_effort="medium",
-            # thinking defaults to enabled on V4-Pro — no need to set explicitly
+            # thinking defaults to enabled on V4.1 Flash — no need to set explicitly
         )
     except ImportError:
         print("[DEEPSEEK:REASONER] openai package not installed. Run: pip install openai>=1.40.0")

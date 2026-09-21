@@ -168,6 +168,14 @@ class BotConfig:
     # Haiku 4.5 pricing (semantic distress classifier): $1/$5 per Mtok.
     haiku_input_cost_per_million: float = 1.0
     haiku_output_cost_per_million: float = 5.0
+    # DeepSeek V4.1 Flash (`deepseek-flash`, both MTG roles since 2026-09-21),
+    # off-peak rates per api-docs.deepseek.com/quick_start/pricing. Every item
+    # bills deepseek_v41_peak_multiplier× during DeepSeek's weekday peak hours
+    # (01–04 + 06–10 UTC, Mon–Fri). Cache hits = the cached subset of input.
+    deepseek_v41_input_cost_per_million: float = 0.15          # cache miss
+    deepseek_v41_cached_input_cost_per_million: float = 0.003  # cache hit
+    deepseek_v41_output_cost_per_million: float = 0.60
+    deepseek_v41_peak_multiplier: float = 2.0
 
     # 🌱 Carbon/energy tracking — order-of-magnitude estimates only (like the $
     # figures, never authoritative). Per-tier inference energy (Wh per 1k tokens)
@@ -309,6 +317,28 @@ class BotConfig:
     # build_support_prompt, build_spiral_prompt below.
 
 CONFIG = BotConfig()
+
+# DeepSeek's peak-pricing windows: (start_hour, end_hour) UTC, end exclusive,
+# Monday–Friday only. Chinese public holidays are exempt upstream but ignored
+# here, so a holiday call over-reports (the safe direction).
+DEEPSEEK_PEAK_HOURS_UTC = ((1, 4), (6, 10))
+
+
+def _deepseek_v41_cost(input_tokens: int, cache_hit_tokens: int, output_tokens: int,
+                       when: Optional[datetime] = None) -> tuple[float, bool]:
+    """Exact $ for one DeepSeek V4.1 Flash call → (cost, was_peak).
+    `input_tokens` includes the cache hits (DeepSeek semantics); hits bill at
+    the cache rate, the rest at the miss rate, all × the peak multiplier when
+    the call lands in a peak window."""
+    when = (when or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    peak = when.weekday() < 5 and any(s <= when.hour < e for s, e in DEEPSEEK_PEAK_HOURS_UTC)
+    hits = max(0, min(cache_hit_tokens or 0, input_tokens))
+    cost = (
+        (input_tokens - hits) * CONFIG.deepseek_v41_input_cost_per_million
+        + hits * CONFIG.deepseek_v41_cached_input_cost_per_million
+        + output_tokens * CONFIG.deepseek_v41_output_cost_per_million
+    ) / 1_000_000
+    return cost * (CONFIG.deepseek_v41_peak_multiplier if peak else 1.0), peak
 
 
 def _extract_anthropic_text(response) -> str:
@@ -1363,6 +1393,20 @@ class CompanionBot(commands.Bot):
         self.deepseek_pro_calls: int = 0
         self.mtg_game_deepseek_pro_input_tokens: int = 0
         self.mtg_game_deepseek_pro_output_tokens: int = 0
+        # 2026-09-21: V4.1 Flash (deepseek-flash — both MTG roles now) gets its
+        # own bucket, priced EXACTLY per call at record time (cache hits,
+        # peak hours) by _deepseek_v41_cost. The two buckets above are frozen
+        # legacy history at their old flat rates, so lifetime !cost isn't
+        # re-priced. `input_tokens` below include the cache hits.
+        self.deepseek_v41_input_tokens: int = 0
+        self.deepseek_v41_cache_hit_tokens: int = 0
+        self.deepseek_v41_output_tokens: int = 0
+        self.deepseek_v41_calls: int = 0
+        self.deepseek_v41_peak_calls: int = 0
+        self.deepseek_v41_cost: float = 0.0
+        self.mtg_game_deepseek_v41_input_tokens: int = 0
+        self.mtg_game_deepseek_v41_output_tokens: int = 0
+        self.mtg_game_deepseek_v41_cost: float = 0.0
         self.api_calls: int = 0
         self._load_persistent_costs()  # Load lifetime totals from disk
         
@@ -1897,6 +1941,11 @@ class CompanionBot(commands.Bot):
             # DeepSeek models (V4-Flash actor, legacy chat/reasoner) route to
             # the actor bucket. Detect by model string: 'v4-pro' / 'pro' /
             # 'reasoner' (deprecated alias for the reasoning model).
+            # 2026-09-21: the strategist moved to deepseek-flash (V4.1 Flash).
+            # Every non-Pro DeepSeek name (deepseek-flash, and the legacy
+            # deepseek-v4-flash alias, which DeepSeek now serves as V4.1 Flash)
+            # goes to the exact-priced V4.1 bucket; the old actor bucket and the
+            # pro bucket are frozen history at their old flat rates.
             model_low = model.lower()
             is_pro = ('v4-pro' in model_low or '-pro' in model_low or
                       'reasoner' in model_low)
@@ -1907,11 +1956,17 @@ class CompanionBot(commands.Bot):
                 self.mtg_game_deepseek_pro_input_tokens += usage.input_tokens
                 self.mtg_game_deepseek_pro_output_tokens += usage.output_tokens
             else:
-                self.deepseek_input_tokens += usage.input_tokens
-                self.deepseek_output_tokens += usage.output_tokens
-                self.deepseek_calls += 1
-                self.mtg_game_deepseek_input_tokens += usage.input_tokens
-                self.mtg_game_deepseek_output_tokens += usage.output_tokens
+                hits = getattr(usage, 'prompt_cache_hit_tokens', 0) or 0
+                cost, peak = _deepseek_v41_cost(usage.input_tokens, hits, usage.output_tokens)
+                self.deepseek_v41_input_tokens += usage.input_tokens
+                self.deepseek_v41_cache_hit_tokens += min(hits, usage.input_tokens)
+                self.deepseek_v41_output_tokens += usage.output_tokens
+                self.deepseek_v41_calls += 1
+                self.deepseek_v41_peak_calls += int(peak)
+                self.deepseek_v41_cost += cost
+                self.mtg_game_deepseek_v41_input_tokens += usage.input_tokens
+                self.mtg_game_deepseek_v41_output_tokens += usage.output_tokens
+                self.mtg_game_deepseek_v41_cost += cost
         elif 'opus' in model.lower():
             self.opus_input_tokens += usage.input_tokens
             self.opus_output_tokens += usage.output_tokens
@@ -1979,6 +2034,18 @@ class CompanionBot(commands.Bot):
                     "mtg_game_deepseek_pro_input_tokens", 0)
                 self.mtg_game_deepseek_pro_output_tokens = data.get(
                     "mtg_game_deepseek_pro_output_tokens", 0)
+                # V4.1 Flash bucket (2026-09-21). Old save files default to 0.
+                self.deepseek_v41_input_tokens = data.get("deepseek_v41_input_tokens", 0)
+                self.deepseek_v41_cache_hit_tokens = data.get("deepseek_v41_cache_hit_tokens", 0)
+                self.deepseek_v41_output_tokens = data.get("deepseek_v41_output_tokens", 0)
+                self.deepseek_v41_calls = data.get("deepseek_v41_calls", 0)
+                self.deepseek_v41_peak_calls = data.get("deepseek_v41_peak_calls", 0)
+                self.deepseek_v41_cost = data.get("deepseek_v41_cost", 0.0)
+                self.mtg_game_deepseek_v41_input_tokens = data.get(
+                    "mtg_game_deepseek_v41_input_tokens", 0)
+                self.mtg_game_deepseek_v41_output_tokens = data.get(
+                    "mtg_game_deepseek_v41_output_tokens", 0)
+                self.mtg_game_deepseek_v41_cost = data.get("mtg_game_deepseek_v41_cost", 0.0)
                 self.api_calls = data.get("api_calls", 0)
                 print(f"\xe2\x9c\x85 Loaded persistent costs: {self.api_calls} calls, {self.total_input_tokens + self.total_output_tokens:,} tokens")
             except Exception as e:
@@ -2015,6 +2082,15 @@ class CompanionBot(commands.Bot):
                 "deepseek_pro_input_tokens": self.deepseek_pro_input_tokens,
                 "deepseek_pro_output_tokens": self.deepseek_pro_output_tokens,
                 "deepseek_pro_calls": self.deepseek_pro_calls,
+                "deepseek_v41_input_tokens": self.deepseek_v41_input_tokens,
+                "deepseek_v41_cache_hit_tokens": self.deepseek_v41_cache_hit_tokens,
+                "deepseek_v41_output_tokens": self.deepseek_v41_output_tokens,
+                "deepseek_v41_calls": self.deepseek_v41_calls,
+                "deepseek_v41_peak_calls": self.deepseek_v41_peak_calls,
+                "deepseek_v41_cost": self.deepseek_v41_cost,
+                "mtg_game_deepseek_v41_input_tokens": self.mtg_game_deepseek_v41_input_tokens,
+                "mtg_game_deepseek_v41_output_tokens": self.mtg_game_deepseek_v41_output_tokens,
+                "mtg_game_deepseek_v41_cost": self.mtg_game_deepseek_v41_cost,
                 "api_calls": self.api_calls,
                 "last_updated": _dt.now().isoformat()
             }
@@ -2036,6 +2112,10 @@ class CompanionBot(commands.Bot):
         # Deepseek V4-Pro (strategist, reasoning_effort=high): $0.56/M input, $1.68/M output
         # May 17 audit: previously lumped at flat V4-Flash rates, under-pricing
         # the strategist by ~50%.
+        # 2026-09-21: both roles now run V4.1 Flash, which has its own bucket
+        # priced exactly per call (self.deepseek_v41_cost). The two buckets
+        # here are frozen legacy history, kept at their old flat rates so
+        # lifetime totals aren't re-priced.
         deepseek_input_cost = (self.deepseek_input_tokens / 1_000_000) * 0.27
         deepseek_output_cost = (self.deepseek_output_tokens / 1_000_000) * 1.10
         deepseek_pro_input_cost = (getattr(self, 'deepseek_pro_input_tokens', 0) / 1_000_000) * 0.56
@@ -2044,8 +2124,9 @@ class CompanionBot(commands.Bot):
         sonnet_cost = sonnet_input_cost + sonnet_output_cost
         opus_cost = opus_input_cost + opus_output_cost
         haiku_cost = haiku_input_cost + haiku_output_cost
-        deepseek_cost = (deepseek_input_cost + deepseek_output_cost
-                         + deepseek_pro_input_cost + deepseek_pro_output_cost)
+        deepseek_legacy_cost = (deepseek_input_cost + deepseek_output_cost
+                                + deepseek_pro_input_cost + deepseek_pro_output_cost)
+        deepseek_cost = deepseek_legacy_cost + self.deepseek_v41_cost
         total_cost = sonnet_cost + opus_cost + haiku_cost + deepseek_cost
 
         # Non-game Sonnet usage (chat, tarot — subtract MTG Sonnet portion)
@@ -2065,12 +2146,14 @@ class CompanionBot(commands.Bot):
         mtg_deepseek_out = getattr(self, 'mtg_game_deepseek_output_tokens', 0)
         mtg_deepseek_pro_in = getattr(self, 'mtg_game_deepseek_pro_input_tokens', 0)
         mtg_deepseek_pro_out = getattr(self, 'mtg_game_deepseek_pro_output_tokens', 0)
+        mtg_deepseek_v41_in = self.mtg_game_deepseek_v41_input_tokens
+        mtg_deepseek_v41_out = self.mtg_game_deepseek_v41_output_tokens
 
-        # MTG game cost = Sonnet portion + Deepseek (flash + pro) + Opus portion (the rest)
+        # MTG game cost = Sonnet portion + Deepseek (flash + pro + V4.1) + Opus portion (the rest)
         mtg_opus_in = max(0, self.mtg_game_input_tokens - mtg_sonnet_in
-                          - mtg_deepseek_in - mtg_deepseek_pro_in)
+                          - mtg_deepseek_in - mtg_deepseek_pro_in - mtg_deepseek_v41_in)
         mtg_opus_out = max(0, self.mtg_game_output_tokens - mtg_sonnet_out
-                           - mtg_deepseek_out - mtg_deepseek_pro_out)
+                           - mtg_deepseek_out - mtg_deepseek_pro_out - mtg_deepseek_v41_out)
         mtg_cost = (
             (mtg_sonnet_in / 1_000_000) * CONFIG.sonnet_input_cost_per_million
             + (mtg_sonnet_out / 1_000_000) * CONFIG.sonnet_output_cost_per_million
@@ -2080,6 +2163,7 @@ class CompanionBot(commands.Bot):
             + (mtg_deepseek_out / 1_000_000) * 1.10          # V4-Flash output
             + (mtg_deepseek_pro_in / 1_000_000) * 0.56       # V4-Pro input
             + (mtg_deepseek_pro_out / 1_000_000) * 1.68      # V4-Pro output
+            + self.mtg_game_deepseek_v41_cost                # V4.1 Flash, exact per call
         )
 
         # 🌱 Rough energy + carbon for the token buckets above (order-of-magnitude,
@@ -2096,6 +2180,7 @@ class CompanionBot(commands.Bot):
             self.deepseek_input_tokens + self.deepseek_output_tokens
             + getattr(self, 'deepseek_pro_input_tokens', 0)
             + getattr(self, 'deepseek_pro_output_tokens', 0)
+            + self.deepseek_v41_input_tokens + self.deepseek_v41_output_tokens
         )
         deepseek_wh = _wh(deepseek_tokens, CONFIG.est_wh_per_1k_deepseek)
         energy_wh = claude_wh + deepseek_wh
@@ -2121,7 +2206,11 @@ class CompanionBot(commands.Bot):
             f"  \u2022 Cost: ${haiku_cost:.4f}",
             "",
             "**Deepseek (autoplay testing):**",
-            f"  \u2022 {self.deepseek_input_tokens:,} input + {self.deepseek_output_tokens:,} output ({self.deepseek_calls} calls)",
+            f"  \u2022 V4.1 Flash: {self.deepseek_v41_input_tokens:,} input "
+            f"({self.deepseek_v41_cache_hit_tokens:,} cached) + {self.deepseek_v41_output_tokens:,} output "
+            f"({self.deepseek_v41_calls} calls, {self.deepseek_v41_peak_calls} at peak) = ${self.deepseek_v41_cost:.4f}",
+            f"  \u2022 Legacy V4 (flat est.): {self.deepseek_input_tokens:,} input + {self.deepseek_output_tokens:,} output "
+            f"({self.deepseek_calls} calls) + V4-Pro {self.deepseek_pro_calls} calls = ${deepseek_legacy_cost:.4f}",
             f"  \u2022 Cost: ${deepseek_cost:.4f}",
             "",
             "**\U0001f3ae MTG Game (included in Sonnet/Opus/Deepseek above):**",
