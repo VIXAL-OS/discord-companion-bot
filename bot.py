@@ -137,7 +137,7 @@ def _format_msg_timestamp(utc_dt: datetime) -> str:
 class BotConfig:
     # Model settings - TRI-MODEL ARCHITECTURE
     model_default: str = "claude-sonnet-5"  # Cost-effective for MTG, general chat (Sonnet 5, 1M ctx)
-    model_support: str = "claude-opus-5"   # Full capability for emotional support (Opus 5)
+    model_support: str = "claude-opus-5-5" # Full capability for emotional support (Opus 5.5)
     model_classifier: str = "claude-haiku-4-5-20251001"  # Fast/cheap for distress classification
     max_tokens: int = 2048
     # More room for nuanced responses. Doubled for Opus 5: adaptive thinking is
